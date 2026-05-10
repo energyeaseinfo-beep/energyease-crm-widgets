@@ -65,6 +65,50 @@ body {
   margin-bottom: 16px;
 }
 
+/* FILTER BUTTONS */
+.filter-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  flex-wrap: wrap;
+}
+.filter-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-right: 6px;
+}
+.filter-btn {
+  background: white;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  color: #475569;
+  transition: all 0.15s;
+}
+.filter-btn:hover {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+}
+.filter-btn.active {
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+  color: white;
+}
+.filter-btn.active:hover {
+  background: #1e40af;
+}
+
 /* SECTION */
 .section {
   background: white;

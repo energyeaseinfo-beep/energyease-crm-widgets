@@ -170,10 +170,39 @@ function computeCashSummary(deals) {
   return {
     toInvoiceNow, toInvoiceNowCount: toInvoiceFirstCount + toInvoiceSecondCount,
     toInvoiceFirstCount, toInvoiceSecondCount,
+    firstOutstandingValue, firstOutstandingCount,
+    secondOutstandingValue, secondOutstandingCount,
     totalOutstanding, totalOutstandingCount,
     inExecutionValue, inExecutionCount,
     futureSecond, stillToReceive
   };
+}
+
+function outstandingHtml(c) {
+  return `<div class="outstanding-box">
+    <h2>💸 Cash summary &mdash; money outstanding</h2>
+    <div class="outstanding-subtitle">Live calculation from Zoho tag data &middot; 50/50 invoicing model</div>
+    <div class="outstanding-grid">
+      <div class="outstanding-tile first">
+        <div class="outstanding-label">1st invoice outstanding</div>
+        <div class="outstanding-value">${fmtEur(c.firstOutstandingValue)}</div>
+        <div class="outstanding-detail">${c.firstOutstandingCount} deal${c.firstOutstandingCount === 1 ? "" : "s"} &middot; half of total</div>
+      </div>
+      <div class="outstanding-tile second">
+        <div class="outstanding-label">2nd invoice outstanding</div>
+        <div class="outstanding-value">${fmtEur(c.secondOutstandingValue)}</div>
+        <div class="outstanding-detail">${c.secondOutstandingCount} deal${c.secondOutstandingCount === 1 ? "" : "s"} &middot; half of total</div>
+      </div>
+      <div class="outstanding-tile total">
+        <div class="outstanding-label">Total outstanding</div>
+        <div class="outstanding-value">${fmtEur(c.totalOutstanding)}</div>
+        <div class="outstanding-detail">${c.totalOutstandingCount} invoice${c.totalOutstandingCount === 1 ? "" : "s"} awaiting payment</div>
+      </div>
+    </div>
+    <div class="outstanding-note">
+      <strong>Assumption:</strong> 50/50 model. Deals with "Cetelem Paid Upfront" or "paid 100%" tags are treated as fully paid. Deviating splits (such as 25/75) are not separately handled.
+    </div>
+  </div>`;
 }
 
 function cashSummaryHtml(c) {
@@ -240,6 +269,7 @@ function render(deals) {
     <div class="scope-note">
       <strong>Scope:</strong> Pipeline = Regular, stages where action is required (Closed Won → Project Done). Project Finalised is excluded. Florian Apartment test deal is filtered out automatically.
     </div>
+    ${outstandingHtml(cash)}
     ${cashSummaryHtml(cash)}
     ${stagesToShow.map(s => panelHtml(s.name, dealsByStage[s.name] || [], s.fn, s.note)).join("")}
   `;

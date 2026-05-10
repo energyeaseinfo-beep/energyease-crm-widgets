@@ -40,6 +40,38 @@ const LOSS_REASON_BUCKET = {
 const root = document.getElementById("root");
 const TODAY = new Date();
 
+// Filter state
+let cachedDeals = null;
+let currentFilter = "all";
+
+// Filter periods (apply to Created_Time)
+const FILTERS = [
+  { id: "all", label: "All time" },
+  { id: "ytd", label: "YTD" },
+  { id: "q", label: "This Quarter" },
+  { id: "90d", label: "Last 90d" },
+  { id: "30d", label: "Last 30d" }
+];
+
+function applyPeriodFilter(deals, filterId) {
+  if (filterId === "all") return deals;
+  const now = TODAY;
+  let cutoff;
+  if (filterId === "ytd") {
+    cutoff = new Date(now.getFullYear(), 0, 1);
+  } else if (filterId === "q") {
+    const q = Math.floor(now.getMonth() / 3);
+    cutoff = new Date(now.getFullYear(), q * 3, 1);
+  } else if (filterId === "90d") {
+    cutoff = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+  } else if (filterId === "30d") {
+    cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  } else {
+    return deals;
+  }
+  return deals.filter(d => d.Created_Time && new Date(d.Created_Time) >= cutoff);
+}
+
 function log(...args) { if (window.console) console.log("[Sales Performance]", ...args); }
 
 function fmtEur(n) {
@@ -356,25 +388,39 @@ function lossReasonsHtml(deals) {
   return html;
 }
 
+// ============== FILTER BUTTONS ==============
+function filterButtonsHtml(activeId) {
+  const buttons = FILTERS.map(f =>
+    `<button class="filter-btn ${f.id === activeId ? "active" : ""}" onclick="window.__sp_setFilter('${f.id}')">${f.label}</button>`
+  ).join("");
+  return `<div class="filter-row">
+    <span class="filter-label">Period:</span>
+    ${buttons}
+  </div>`;
+}
+
 // ============== MAIN RENDER ==============
-function render(deals) {
-  const filtered = deals.filter(d => d.Pipeline === PIPELINE_FILTER);
-  log("Filtered deals:", filtered.length);
+function render(allDeals, filterId) {
+  const pipelineFiltered = allDeals.filter(d => d.Pipeline === PIPELINE_FILTER);
+  const filtered = applyPeriodFilter(pipelineFiltered, filterId);
+  log("Filter:", filterId, "deals after filter:", filtered.length, "of", pipelineFiltered.length);
 
   const kpis = computeKPIs(filtered);
   const leaders = computeLeaderboard(filtered);
   const ts = new Date().toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
+  const activeFilterLabel = (FILTERS.find(f => f.id === filterId) || FILTERS[0]).label;
 
   const html = `
     <div class="header">
       <div>
         <h1>Sales Performance</h1>
-        <div class="meta">Live from Zoho CRM · ${filtered.length} deals · refreshed ${ts}</div>
+        <div class="meta">Live from Zoho CRM · ${filtered.length} deals (${activeFilterLabel}) · refreshed ${ts}</div>
       </div>
       <button class="refresh-btn" onclick="window.__sp_refresh()">Refresh</button>
     </div>
+    ${filterButtonsHtml(filterId)}
     <div class="scope-note">
-      <strong>Scope:</strong> Pipeline = Regular · advisor stats exclude customer-service intake (Inspection Scheduled stage and Tomas Rodrigues as owner) · ghosted Quote Sent (21d+ idle) automatically reclassified as Closed Lost per Pipeline Rules.
+      <strong>Scope:</strong> Pipeline = Regular · period filter on Created_Time · advisor stats exclude customer-service intake (Inspection Scheduled stage and Tomas Rodrigues as owner) · ghosted Quote Sent (21d+ idle) automatically reclassified as Closed Lost per Pipeline Rules.
     </div>
     ${kpiHtml(kpis)}
     ${leaderboardHtml(leaders)}
@@ -417,8 +463,8 @@ async function fetchAllDeals() {
 async function loadAndRender() {
   try {
     root.innerHTML = `<div class="loading-state"><div class="spinner"></div><div>Fetching deals from Zoho CRM&hellip;</div></div>`;
-    const deals = await fetchAllDeals();
-    render(deals);
+    cachedDeals = await fetchAllDeals();
+    render(cachedDeals, currentFilter);
   } catch (e) {
     log("error", e);
     renderError("Unable to load deals.", e && e.message ? e.message : String(e));
@@ -426,6 +472,14 @@ async function loadAndRender() {
 }
 
 window.__sp_refresh = loadAndRender;
+window.__sp_setFilter = function (filterId) {
+  currentFilter = filterId;
+  if (cachedDeals) {
+    render(cachedDeals, currentFilter);
+  } else {
+    loadAndRender();
+  }
+};
 
 if (window.ZOHO && ZOHO.embeddedApp) {
   ZOHO.embeddedApp.on("PageLoad", function () {

@@ -191,6 +191,73 @@ body {
   white-space: nowrap;
 }
 
+/* OUTSTANDING BOX (prominent orange) */
+.outstanding-box {
+  background: linear-gradient(135deg, #fed7aa 0%, #fcd34d 100%);
+  border: 2px solid #f59e0b;
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+.outstanding-box h2 {
+  color: #92400e;
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.outstanding-subtitle {
+  color: #78350f;
+  font-size: 12px;
+  margin-bottom: 14px;
+}
+.outstanding-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12px;
+}
+.outstanding-tile {
+  background: white;
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+.outstanding-tile.first { border-left: 4px solid #f59e0b; }
+.outstanding-tile.second { border-left: 4px solid #d97706; }
+.outstanding-tile.total { background: #92400e; color: white; }
+.outstanding-label {
+  font-size: 10px;
+  color: #92400e;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.outstanding-tile.total .outstanding-label { color: rgba(255,255,255,0.9); }
+.outstanding-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: #0f172a;
+  margin-bottom: 2px;
+}
+.outstanding-tile.total .outstanding-value { color: white; font-size: 30px; }
+.outstanding-detail {
+  font-size: 11px;
+  color: #78350f;
+}
+.outstanding-tile.total .outstanding-detail { color: rgba(255,255,255,0.85); }
+.outstanding-note {
+  background: rgba(255,255,255,0.6);
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin-top: 12px;
+  font-size: 11px;
+  color: #78350f;
+}
+.outstanding-note strong { color: #92400e; }
+
+@media (max-width: 800px) {
+  .outstanding-grid { grid-template-columns: 1fr; }
+}
+
 /* CASH SUMMARY */
 .cash-summary {
   display: grid;
