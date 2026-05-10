@@ -43,6 +43,8 @@ const TODAY = new Date();
 // Filter state
 let cachedDeals = null;
 let currentFilter = "all";
+let customFrom = null; // ISO date string YYYY-MM-DD
+let customTo = null;
 
 // Filter periods (apply to Created_Time)
 const FILTERS = [
@@ -50,26 +52,47 @@ const FILTERS = [
   { id: "ytd", label: "YTD" },
   { id: "q", label: "This Quarter" },
   { id: "90d", label: "Last 90d" },
-  { id: "30d", label: "Last 30d" }
+  { id: "30d", label: "Last 30d" },
+  { id: "custom", label: "Custom" }
 ];
 
 function applyPeriodFilter(deals, filterId) {
   if (filterId === "all") return deals;
   const now = TODAY;
-  let cutoff;
+  let cutoffFrom, cutoffTo;
   if (filterId === "ytd") {
-    cutoff = new Date(now.getFullYear(), 0, 1);
+    cutoffFrom = new Date(now.getFullYear(), 0, 1);
   } else if (filterId === "q") {
     const q = Math.floor(now.getMonth() / 3);
-    cutoff = new Date(now.getFullYear(), q * 3, 1);
+    cutoffFrom = new Date(now.getFullYear(), q * 3, 1);
   } else if (filterId === "90d") {
-    cutoff = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+    cutoffFrom = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
   } else if (filterId === "30d") {
-    cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    cutoffFrom = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  } else if (filterId === "custom") {
+    if (customFrom) cutoffFrom = new Date(customFrom + "T00:00:00");
+    if (customTo) cutoffTo = new Date(customTo + "T23:59:59");
   } else {
     return deals;
   }
-  return deals.filter(d => d.Created_Time && new Date(d.Created_Time) >= cutoff);
+  return deals.filter(d => {
+    if (!d.Created_Time) return false;
+    const t = new Date(d.Created_Time);
+    if (cutoffFrom && t < cutoffFrom) return false;
+    if (cutoffTo && t > cutoffTo) return false;
+    return true;
+  });
+}
+
+// Default custom range when first opening Custom: last 30 days
+function ensureCustomDefaults() {
+  if (!customFrom) {
+    const d = new Date(TODAY.getTime() - 30 * 24 * 60 * 60 * 1000);
+    customFrom = d.toISOString().slice(0, 10);
+  }
+  if (!customTo) {
+    customTo = TODAY.toISOString().slice(0, 10);
+  }
 }
 
 function log(...args) { if (window.console) console.log("[Sales Performance]", ...args); }
@@ -393,10 +416,20 @@ function filterButtonsHtml(activeId) {
   const buttons = FILTERS.map(f =>
     `<button class="filter-btn ${f.id === activeId ? "active" : ""}" onclick="window.__sp_setFilter('${f.id}')">${f.label}</button>`
   ).join("");
+  let customRow = "";
+  if (activeId === "custom") {
+    ensureCustomDefaults();
+    customRow = `<div class="filter-custom-row">
+      <span class="filter-label">From:</span>
+      <input type="date" class="filter-date" value="${customFrom}" onchange="window.__sp_setCustomDate('from', this.value)" max="${TODAY.toISOString().slice(0,10)}">
+      <span class="filter-label">To:</span>
+      <input type="date" class="filter-date" value="${customTo}" onchange="window.__sp_setCustomDate('to', this.value)" max="${TODAY.toISOString().slice(0,10)}">
+    </div>`;
+  }
   return `<div class="filter-row">
     <span class="filter-label">Period:</span>
     ${buttons}
-  </div>`;
+  </div>${customRow}`;
 }
 
 // ============== MAIN RENDER ==============
@@ -479,6 +512,17 @@ window.__sp_setFilter = function (filterId) {
   } else {
     loadAndRender();
   }
+};
+window.__sp_setCustomDate = function (which, value) {
+  if (which === "from") customFrom = value;
+  if (which === "to") customTo = value;
+  // Validate from <= to; if reversed, swap
+  if (customFrom && customTo && customFrom > customTo) {
+    const tmp = customFrom;
+    customFrom = customTo;
+    customTo = tmp;
+  }
+  if (cachedDeals) render(cachedDeals, currentFilter);
 };
 
 if (window.ZOHO && ZOHO.embeddedApp) {

@@ -109,6 +109,34 @@ body {
   background: #1e40af;
 }
 
+.filter-custom-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: -6px;
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  flex-wrap: wrap;
+}
+.filter-date {
+  background: white;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  color: #1e293b;
+  cursor: pointer;
+}
+.filter-date:focus {
+  outline: 2px solid #93c5fd;
+  outline-offset: 1px;
+  border-color: #1d4ed8;
+}
+
 /* SECTION */
 .section {
   background: white;
