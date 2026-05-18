@@ -131,40 +131,80 @@ function panelHtml(stageName, dealsInStage, classifyFn, actionNote) {
 }
 
 function computeCashSummary(deals) {
+  // Per-deal payment-split detection:
+  //   - 100% upfront ("Cetelem Paid Upfront" or "paid 100%") → no outstanding, no future invoice
+  //   - 25/75 ("Paid 25%" or "First 25%" tag) → first invoice = 25%, second = 75%
+  //   - default 50/50
+  // futureSecond is tracked explicitly per deal (NOT inExecutionValue / 2) so Cetelem deals don't inflate it.
   let firstOutstandingValue = 0, firstOutstandingCount = 0;
   let secondOutstandingValue = 0, secondOutstandingCount = 0;
   let toInvoiceFirstValue = 0, toInvoiceFirstCount = 0;
   let toInvoiceSecondValue = 0, toInvoiceSecondCount = 0;
   let inExecutionValue = 0, inExecutionCount = 0;
+  let inExecutionReceived = 0;
+  let futureSecond = 0;
 
   deals.forEach(d => {
     const amt = Number(d.Amount) || 0;
-    const half = amt / 2;
     const stage = d.Stage;
+
     const fullPaid = hasTag(d, "paid 100%") || hasTag(d, "Cetelem Paid Upfront");
-    const firstSent = hasTag(d, "First 50% sent");
-    const firstPaid = hasTag(d, "Paid 50%") || fullPaid;
+    const is25Split = hasTag(d, "Paid 25%") || hasTag(d, "First 25%");
+    const firstPct = is25Split ? 0.25 : 0.50;
+    const secondPct = 1 - firstPct;
+    const firstInvoiceAmt = amt * firstPct;
+    const secondInvoiceAmt = amt * secondPct;
+
+    const firstSent = hasTag(d, "First 50% sent") || hasTag(d, "First 25%");
+    const firstPaid = hasTag(d, "Paid 50%") || hasTag(d, "Paid 25%") || fullPaid;
     const lastSent = hasTag(d, "Sent last invoice");
 
     if (stage === "Closed Won") {
-      if (!firstSent && !firstPaid) { toInvoiceFirstCount++; toInvoiceFirstValue += half; }
-      else if (firstSent && !firstPaid) { firstOutstandingCount++; firstOutstandingValue += half; }
+      if (fullPaid) {
+        // 100% paid (e.g. Cetelem). Nothing outstanding.
+      } else if (!firstSent && !firstPaid) {
+        toInvoiceFirstCount++;
+        toInvoiceFirstValue += firstInvoiceAmt;
+      } else if (firstSent && !firstPaid) {
+        firstOutstandingCount++;
+        firstOutstandingValue += firstInvoiceAmt;
+      }
     }
     if (stage === "Scheduled Execution" || stage === "Project Started") {
-      if (firstPaid) { inExecutionCount++; inExecutionValue += amt; }
-      else if (firstSent) { firstOutstandingCount++; firstOutstandingValue += half; }
-      else { toInvoiceFirstCount++; toInvoiceFirstValue += half; }
+      if (fullPaid) {
+        // 100% upfront — in execution but no future invoice expected
+        inExecutionCount++;
+        inExecutionValue += amt;
+        inExecutionReceived += amt;
+      } else if (firstPaid) {
+        inExecutionCount++;
+        inExecutionValue += amt;
+        inExecutionReceived += firstInvoiceAmt;
+        futureSecond += secondInvoiceAmt;
+      } else if (firstSent) {
+        firstOutstandingCount++;
+        firstOutstandingValue += firstInvoiceAmt;
+      } else {
+        toInvoiceFirstCount++;
+        toInvoiceFirstValue += firstInvoiceAmt;
+      }
     }
     if (stage === "Project Done") {
-      if (!lastSent && !fullPaid) { toInvoiceSecondCount++; toInvoiceSecondValue += half; }
-      else if (lastSent && !fullPaid) { secondOutstandingCount++; secondOutstandingValue += half; }
+      if (fullPaid) {
+        // 100% paid, project done. Nothing outstanding.
+      } else if (!lastSent) {
+        toInvoiceSecondCount++;
+        toInvoiceSecondValue += secondInvoiceAmt;
+      } else if (lastSent) {
+        secondOutstandingCount++;
+        secondOutstandingValue += secondInvoiceAmt;
+      }
     }
   });
 
   const totalOutstanding = firstOutstandingValue + secondOutstandingValue;
   const totalOutstandingCount = firstOutstandingCount + secondOutstandingCount;
   const toInvoiceNow = toInvoiceFirstValue + toInvoiceSecondValue;
-  const futureSecond = inExecutionValue / 2;
   const stillToReceive = totalOutstanding + toInvoiceNow + futureSecond;
 
   return {
@@ -173,7 +213,7 @@ function computeCashSummary(deals) {
     firstOutstandingValue, firstOutstandingCount,
     secondOutstandingValue, secondOutstandingCount,
     totalOutstanding, totalOutstandingCount,
-    inExecutionValue, inExecutionCount,
+    inExecutionValue, inExecutionCount, inExecutionReceived,
     futureSecond, stillToReceive
   };
 }
@@ -181,17 +221,17 @@ function computeCashSummary(deals) {
 function outstandingHtml(c) {
   return `<div class="outstanding-box">
     <h2>💸 Cash summary &mdash; money outstanding</h2>
-    <div class="outstanding-subtitle">Live calculation from Zoho tag data &middot; 50/50 invoicing model</div>
+    <div class="outstanding-subtitle">Live calculation from Zoho tag data &middot; per-deal split detection (50/50, 25/75, or 100% upfront)</div>
     <div class="outstanding-grid">
       <div class="outstanding-tile first">
         <div class="outstanding-label">1st invoice outstanding</div>
         <div class="outstanding-value">${fmtEur(c.firstOutstandingValue)}</div>
-        <div class="outstanding-detail">${c.firstOutstandingCount} deal${c.firstOutstandingCount === 1 ? "" : "s"} &middot; half of total</div>
+        <div class="outstanding-detail">${c.firstOutstandingCount} deal${c.firstOutstandingCount === 1 ? "" : "s"} &middot; 1st-invoice portion only</div>
       </div>
       <div class="outstanding-tile second">
         <div class="outstanding-label">2nd invoice outstanding</div>
         <div class="outstanding-value">${fmtEur(c.secondOutstandingValue)}</div>
-        <div class="outstanding-detail">${c.secondOutstandingCount} deal${c.secondOutstandingCount === 1 ? "" : "s"} &middot; half of total</div>
+        <div class="outstanding-detail">${c.secondOutstandingCount} deal${c.secondOutstandingCount === 1 ? "" : "s"} &middot; final-invoice portion only</div>
       </div>
       <div class="outstanding-tile total">
         <div class="outstanding-label">Total outstanding</div>
@@ -200,7 +240,7 @@ function outstandingHtml(c) {
       </div>
     </div>
     <div class="outstanding-note">
-      <strong>Assumption:</strong> 50/50 model. Deals with "Cetelem Paid Upfront" or "paid 100%" tags are treated as fully paid. Deviating splits (such as 25/75) are not separately handled.
+      <strong>Invoice splits:</strong> 50/50 default. "Paid 25%" / "First 25%" tags trigger 25/75 split. "Cetelem Paid Upfront" / "paid 100%" tags mark deals as fully paid — they don't contribute to outstanding or future invoices.
     </div>
   </div>`;
 }
@@ -210,7 +250,7 @@ function cashSummaryHtml(c) {
     <div class="cash-tile action">
       <div class="cash-label">To invoice NOW</div>
       <div class="cash-value">${fmtEur(c.toInvoiceNow)}</div>
-      <div class="cash-detail">${c.toInvoiceFirstCount}× 1st (Closed Won) + ${c.toInvoiceSecondCount}× final (Project Done)</div>
+      <div class="cash-detail">${c.toInvoiceFirstCount}&times; 1st (Closed Won) + ${c.toInvoiceSecondCount}&times; final (Project Done)</div>
     </div>
     <div class="cash-tile outstanding">
       <div class="cash-label">Outstanding invoices</div>
@@ -218,14 +258,14 @@ function cashSummaryHtml(c) {
       <div class="cash-detail">${c.totalOutstandingCount} sent, not paid</div>
     </div>
     <div class="cash-tile in-progress">
-      <div class="cash-label">In execution (50% received)</div>
+      <div class="cash-label">In execution &mdash; contract value</div>
       <div class="cash-value">${fmtEur(c.inExecutionValue)}</div>
-      <div class="cash-detail">${c.inExecutionCount} ongoing project${c.inExecutionCount === 1 ? "" : "s"}</div>
+      <div class="cash-detail">${c.inExecutionCount} ongoing project${c.inExecutionCount === 1 ? "" : "s"} &middot; ${fmtEur(c.inExecutionReceived)} already received</div>
     </div>
     <div class="cash-tile future">
       <div class="cash-label">After project completion</div>
       <div class="cash-value">${fmtEur(c.futureSecond)}</div>
-      <div class="cash-detail">2nd invoice potential</div>
+      <div class="cash-detail">future invoices (Cetelem-paid deals excluded)</div>
     </div>
     <div class="cash-tile received">
       <div class="cash-label">Total still to receive</div>
