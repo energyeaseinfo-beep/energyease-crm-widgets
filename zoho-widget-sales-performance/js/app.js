@@ -4,6 +4,17 @@ const PIPELINE_FILTER = "Regular";
 const TESTDEAL_IDS = new Set(["680374000007820138", "680374000005010079"]);
 const STALE_QUOTE_DAYS = 21; // Pipeline Rules: ghosted Quote Sent → Closed Lost after 21 days
 
+// Blown-in product IDs — if the most recent quote of a deal contains any of these as a line item,
+// the deal is classified as a blown-in project. List confirmed by Florian (service items + old inactive).
+const BLOWN_IN_PRODUCT_IDS = [
+  "680374000001323055", // Execução Insuflação (Blown-In) — inactive
+  "680374000003136002", // Blown in — inactive
+  "680374000003994071", // Material (Blown-In) - Lã Mineral SUPAFIL LOFT 45
+  "680374000016614001", // Execução Insuflação — Caixa de Ar
+  "680374000016614002", // Execução Insuflação — Teto Falso
+  "680374000016614003", // Execução Insuflação — Pavimento do Sótão
+];
+
 // Stages that count as "won" for conversion (they ALL passed through Closed Won)
 const WON_STAGES = new Set([
   "Closed Won", "Scheduled Execution", "Project Started", "Project Done", "Project Finalised"
@@ -45,6 +56,10 @@ let cachedDeals = null;
 let currentFilter = "all";
 let customFrom = null; // ISO date string YYYY-MM-DD
 let customTo = null;
+
+// Blown-in detection state: null = not yet loaded, Set = loaded set of dealIds
+let blownInDealIds = null;
+let blownInLoadError = null;
 
 // Lead Intake state (independent of period filter)
 let leadIntakeGranularity = "weekly";
@@ -168,7 +183,14 @@ function computeKPIs(deals) {
   const decided = wonDeals.length + lostDeals.length;
 
   const realisedRevenue = wonDeals.reduce((s, d) => s + (Number(d.Amount) || 0), 0);
+
+  // Method 1: Quote Sent → Won (decided ratio, with Pipeline Rules 21d ghost)
   const quoteToClose = decided > 0 ? (wonDeals.length / decided) * 100 : 0;
+
+  // Method 2: Inspection Qualified → Won (broader — includes still-in-flight deals)
+  const inspQualIdx = STAGE_ORDER.indexOf("Inspection Qualified");
+  const reachedInspQual = advisorDeals.filter(d => STAGE_ORDER.indexOf(d.Stage) >= inspQualIdx).length;
+  const inspectionToWon = reachedInspQual > 0 ? (wonDeals.length / reachedInspQual) * 100 : 0;
 
   // Lead → Quote: deals that reached Quote Sent (or beyond) / total advisor deals
   const reachedQuote = advisorDeals.filter(d => {
@@ -185,25 +207,85 @@ function computeKPIs(deals) {
   const inQuoteSent = advisorDeals.filter(d => d.Stage === "Quote Sent").length;
 
   return { total, advisorTotal: advisorDeals.length, wonCount: wonDeals.length, lostCount: lostDeals.length,
-    realisedRevenue, quoteToClose, leadToQuote, avgCycle, inQuoteSent };
+    reachedInspQual, realisedRevenue, quoteToClose, inspectionToWon, leadToQuote, avgCycle, inQuoteSent };
+}
+
+// Compute conversion rates over a specific date range (Created_Time based)
+// Returns { m1, m2, wonCount, decidedCount, reachedInspQual }
+function computeConversionForRange(allDeals, from, to) {
+  const inRange = allDeals.filter(d => {
+    if (!d.Created_Time) return false;
+    const t = new Date(d.Created_Time);
+    return t >= from && t <= to;
+  });
+  const advisorDeals = inRange.filter(isAdvisorAttributable);
+  const wonDeals = advisorDeals.filter(d => WON_STAGES.has(d.Stage));
+  const lostDeals = advisorDeals.filter(isEffectivelyLost);
+  const decided = wonDeals.length + lostDeals.length;
+  const m1 = decided > 0 ? (wonDeals.length / decided) * 100 : null;
+
+  const inspQualIdx = STAGE_ORDER.indexOf("Inspection Qualified");
+  const reachedInspQual = advisorDeals.filter(d => STAGE_ORDER.indexOf(d.Stage) >= inspQualIdx).length;
+  const m2 = reachedInspQual > 0 ? (wonDeals.length / reachedInspQual) * 100 : null;
+
+  return { m1, m2, wonCount: wonDeals.length, decidedCount: decided, reachedInspQual };
+}
+
+function computeConversionTrend(allDeals) {
+  // This month: 1st of current month → today
+  // Last month: 1st of last month → end of last month
+  // Last quarter: 1st of last quarter → end of last quarter
+  const now = TODAY;
+  const thisMonthFrom = new Date(now.getFullYear(), now.getMonth(), 1);
+  const thisMonthTo = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+  const lastMonthFrom = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const lastMonthTo = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+
+  const currentQ = Math.floor(now.getMonth() / 3);
+  const lastQOffset = 1;
+  const totalQuartersAgo = now.getFullYear() * 4 + currentQ - lastQOffset;
+  const lastQYear = Math.floor(totalQuartersAgo / 4);
+  const lastQIdx = ((totalQuartersAgo % 4) + 4) % 4;
+  const lastQFrom = new Date(lastQYear, lastQIdx * 3, 1);
+  const lastQTo = new Date(lastQYear, lastQIdx * 3 + 3, 0, 23, 59, 59);
+
+  return [
+    { label: "This month", sub: monthLabel(thisMonthFrom), ...computeConversionForRange(allDeals, thisMonthFrom, thisMonthTo) },
+    { label: "Last month", sub: monthLabel(lastMonthFrom), ...computeConversionForRange(allDeals, lastMonthFrom, lastMonthTo) },
+    { label: "Last quarter", sub: `Q${lastQIdx + 1} ${lastQYear}`, ...computeConversionForRange(allDeals, lastQFrom, lastQTo) }
+  ];
+}
+
+function monthLabel(d) {
+  return d.toLocaleDateString("en-GB", { month: "short", year: "numeric" });
 }
 
 function kpiHtml(k) {
   return `<div class="kpi-row">
     <div class="kpi hero">
-      <div class="kpi-label">Quote → Close conversion</div>
+      <div class="kpi-label">Quote → Won conversion</div>
       <div class="kpi-value">${fmtPct(k.quoteToClose)}</div>
-      <div class="kpi-sub">${k.wonCount} won / ${k.wonCount + k.lostCount} decided · Pipeline Rules applied (21d ghosted = lost)</div>
+      <div class="kpi-sub">M1: ${k.wonCount} won / ${k.wonCount + k.lostCount} decided · 21d ghost rule</div>
     </div>
-    <div class="kpi win">
-      <div class="kpi-label">Lead → Quote conversion</div>
-      <div class="kpi-value">${fmtPct(k.leadToQuote)}</div>
-      <div class="kpi-sub">${k.advisorTotal} advisor deals total</div>
+    <div class="kpi hero2">
+      <div class="kpi-label">Inspection → Won conversion</div>
+      <div class="kpi-value">${fmtPct(k.inspectionToWon)}</div>
+      <div class="kpi-sub">M2: ${k.wonCount} won / ${k.reachedInspQual} qualified leads (incl. in-flight)</div>
+    </div>
+    <div class="kpi projects">
+      <div class="kpi-label">Total projects</div>
+      <div class="kpi-value">${k.wonCount}</div>
+      <div class="kpi-sub">Closed Won + execution + finalised</div>
     </div>
     <div class="kpi revenue">
       <div class="kpi-label">Realised revenue</div>
       <div class="kpi-value">${fmtEur(k.realisedRevenue)}</div>
       <div class="kpi-sub">total of won deals</div>
+    </div>
+    <div class="kpi win">
+      <div class="kpi-label">Lead → Quote conversion</div>
+      <div class="kpi-value">${fmtPct(k.leadToQuote)}</div>
+      <div class="kpi-sub">${k.advisorTotal} advisor deals total</div>
     </div>
     <div class="kpi warn">
       <div class="kpi-label">In Quote Sent</div>
@@ -214,6 +296,103 @@ function kpiHtml(k) {
       <div class="kpi-label">Avg sales cycle</div>
       <div class="kpi-value">${k.avgCycle !== null ? Math.round(k.avgCycle) + "d" : "—"}</div>
       <div class="kpi-sub">won deals only</div>
+    </div>
+  </div>`;
+}
+
+// ============== BLOWN-IN STATS ==============
+function computeBlownInStats(deals, blownInSet) {
+  // Only count deals that became projects (= won deals)
+  const projects = deals.filter(d => WON_STAGES.has(d.Stage));
+  let blownInCount = 0, blownInRevenue = 0;
+  let otherCount = 0, otherRevenue = 0;
+  projects.forEach(d => {
+    const amt = Number(d.Amount) || 0;
+    if (blownInSet && blownInSet.has(d.id)) {
+      blownInCount++;
+      blownInRevenue += amt;
+    } else {
+      otherCount++;
+      otherRevenue += amt;
+    }
+  });
+  const total = projects.length;
+  const sharePct = total > 0 ? (blownInCount / total) * 100 : 0;
+  const otherSharePct = total > 0 ? (otherCount / total) * 100 : 0;
+  return { total, blownInCount, blownInRevenue, otherCount, otherRevenue, sharePct, otherSharePct };
+}
+
+function blownInHtml(stats, isLoading) {
+  if (isLoading) {
+    return `<div class="section">
+      <h2>🌬️ Blown-in share of projects</h2>
+      <div class="subtitle">Computing from Quote line items&hellip;</div>
+      <div class="intake-summary">
+        <div class="intake-summary-label">Loading</div>
+        <div class="intake-summary-value" style="font-size:14px; font-weight:400; color:#64748b;">Fetching Quote data, this may take a few seconds.</div>
+      </div>
+    </div>`;
+  }
+  if (blownInLoadError) {
+    return `<div class="section">
+      <h2>🌬️ Blown-in share of projects</h2>
+      <div class="subtitle" style="color:#dc2626;">Could not load blown-in data: ${escapeHtml(blownInLoadError)}</div>
+    </div>`;
+  }
+  const avgBlownIn = stats.blownInCount > 0 ? stats.blownInRevenue / stats.blownInCount : 0;
+  const avgOther = stats.otherCount > 0 ? stats.otherRevenue / stats.otherCount : 0;
+  return `<div class="section">
+    <h2>🌬️ Blown-in share of projects</h2>
+    <div class="subtitle">Project = Closed Won or beyond · classification based on most recent quote's line items · ${stats.total} project${stats.total === 1 ? "" : "s"} analysed</div>
+    <div class="blown-in-grid">
+      <div class="blown-in-tile blown">
+        <div class="blown-in-label">Blown-in projects</div>
+        <div class="blown-in-value">${stats.blownInCount}</div>
+        <div class="blown-in-pct">${fmtPct(stats.sharePct)} of total</div>
+        <div class="blown-in-detail">${fmtEur(stats.blownInRevenue)} revenue · avg ${fmtEur(avgBlownIn)}/deal</div>
+      </div>
+      <div class="blown-in-tile other">
+        <div class="blown-in-label">Other techniques</div>
+        <div class="blown-in-value">${stats.otherCount}</div>
+        <div class="blown-in-pct">${fmtPct(stats.otherSharePct)} of total</div>
+        <div class="blown-in-detail">${fmtEur(stats.otherRevenue)} revenue · avg ${fmtEur(avgOther)}/deal</div>
+      </div>
+      <div class="blown-in-tile total">
+        <div class="blown-in-label">Total projects</div>
+        <div class="blown-in-value">${stats.total}</div>
+        <div class="blown-in-pct">100%</div>
+        <div class="blown-in-detail">${fmtEur(stats.blownInRevenue + stats.otherRevenue)} total revenue</div>
+      </div>
+    </div>
+    <div class="blown-in-bar">
+      <div class="blown-in-bar-blown" style="width:${stats.sharePct}%" title="Blown-in ${fmtPct(stats.sharePct)}"></div>
+      <div class="blown-in-bar-other" style="width:${stats.otherSharePct}%" title="Other ${fmtPct(stats.otherSharePct)}"></div>
+    </div>
+  </div>`;
+}
+
+function conversionTrendHtml(trend) {
+  const fmt = (v) => v === null ? "—" : fmtPct(v);
+  return `<div class="section">
+    <h2>📈 Conversion trend</h2>
+    <div class="subtitle">Both methods over time · M1 = Quote→Won (decided, 21d rule) · M2 = Inspection→Won (incl. in-flight) · period filter ignored, uses Created_Time</div>
+    <div class="trend-grid">
+      ${trend.map(t => `<div class="trend-cell">
+        <div class="trend-period">${escapeHtml(t.label)}</div>
+        <div class="trend-sub">${escapeHtml(t.sub)}</div>
+        <div class="trend-metrics">
+          <div class="trend-metric">
+            <div class="trend-metric-label">Quote → Won</div>
+            <div class="trend-metric-value">${fmt(t.m1)}</div>
+            <div class="trend-metric-sub">${t.wonCount} / ${t.decidedCount} decided</div>
+          </div>
+          <div class="trend-metric">
+            <div class="trend-metric-label">Inspection → Won</div>
+            <div class="trend-metric-value">${fmt(t.m2)}</div>
+            <div class="trend-metric-sub">${t.wonCount} / ${t.reachedInspQual} qualified</div>
+          </div>
+        </div>
+      </div>`).join("")}
     </div>
   </div>`;
 }
@@ -620,6 +799,9 @@ function render(allDeals, filterId) {
   const kpis = computeKPIs(filtered);
   const leaders = computeLeaderboard(filtered);
   const intake = computeLeadIntake(pipelineFiltered, leadIntakeGranularity);
+  const trend = computeConversionTrend(pipelineFiltered);
+  const blownIn = computeBlownInStats(filtered, blownInDealIds);
+  const blownInLoading = blownInDealIds === null && !blownInLoadError;
   const ts = new Date().toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
   const activeFilterLabel = (FILTERS.find(f => f.id === filterId) || FILTERS[0]).label;
 
@@ -636,6 +818,8 @@ function render(allDeals, filterId) {
       <strong>Scope:</strong> Pipeline = Regular · period filter on Created_Time · advisor stats exclude customer-service intake (Inspection Scheduled stage and Tomas Rodrigues as owner) · ghosted Quote Sent (21d+ idle) automatically reclassified as Closed Lost per Pipeline Rules.
     </div>
     ${kpiHtml(kpis)}
+    ${conversionTrendHtml(trend)}
+    ${blownInHtml(blownIn, blownInLoading)}
     ${leaderboardHtml(leaders)}
     ${trophiesHtml(leaders)}
     ${leadIntakeHtml(intake, leadIntakeGranularity)}
@@ -674,11 +858,89 @@ async function fetchAllDeals() {
   return all;
 }
 
+// ============== BLOWN-IN DETECTION ==============
+// Two COQL queries: (1) all quotes with deal + created_time, (2) all quoted_items with blown-in products.
+// Then in JS: for each deal find most recent quote, check if it has blown-in items.
+async function coqlAllPages(baseQuery) {
+  if (!window.ZOHO || !ZOHO.CRM || !ZOHO.CRM.API || !ZOHO.CRM.API.coql) {
+    throw new Error("COQL API not available in SDK");
+  }
+  const all = [];
+  let offset = 0;
+  const limit = 200;
+  while (true) {
+    const query = `${baseQuery} limit ${offset},${limit}`;
+    const resp = await ZOHO.CRM.API.coql({ select_query: query });
+    const rows = (resp && resp.data) || [];
+    if (!rows.length) break;
+    all.push(...rows);
+    if (rows.length < limit) break;
+    offset += limit;
+    if (offset > 10000) break; // safety
+  }
+  return all;
+}
+
+async function fetchBlownInDealIds() {
+  try {
+    // Step 1: all Quotes with deal lookup + created time
+    log("Fetching quotes for blown-in detection...");
+    const quotes = await coqlAllPages(
+      "select id, Deal_Name, Created_Time from Quotes where id is not null order by Created_Time desc"
+    );
+    log("Fetched", quotes.length, "quotes");
+
+    // Build map dealId → most recent quoteId
+    const dealToLatestQuote = {};
+    quotes.forEach(q => {
+      if (!q.Deal_Name || !q.Deal_Name.id || !q.Created_Time) return;
+      const dealId = q.Deal_Name.id;
+      const existing = dealToLatestQuote[dealId];
+      if (!existing || new Date(q.Created_Time) > new Date(existing.time)) {
+        dealToLatestQuote[dealId] = { quoteId: q.id, time: q.Created_Time };
+      }
+    });
+    log("Built deal→latestQuote map:", Object.keys(dealToLatestQuote).length, "deals");
+
+    // Step 2: all Quoted_Items with blown-in product
+    const productList = BLOWN_IN_PRODUCT_IDS.join(",");
+    const blownInItems = await coqlAllPages(
+      `select id, Parent_Id, Product_Name from Quoted_Items where Product_Name in (${productList})`
+    );
+    log("Fetched", blownInItems.length, "blown-in quoted items");
+
+    const blownInQuoteIds = new Set();
+    blownInItems.forEach(it => {
+      const pid = it.Parent_Id && (it.Parent_Id.id || it.Parent_Id);
+      if (pid) blownInQuoteIds.add(String(pid));
+    });
+    log("Blown-in quote ids:", blownInQuoteIds.size);
+
+    // Step 3: intersect — deals whose most recent quote is in the blown-in set
+    const result = new Set();
+    Object.entries(dealToLatestQuote).forEach(([dealId, info]) => {
+      if (blownInQuoteIds.has(String(info.quoteId))) result.add(dealId);
+    });
+    log("Blown-in deals found:", result.size);
+    return result;
+  } catch (e) {
+    log("Blown-in detection failed:", e);
+    blownInLoadError = e && e.message ? e.message : String(e);
+    return null;
+  }
+}
+
 async function loadAndRender() {
   try {
     root.innerHTML = `<div class="loading-state"><div class="spinner"></div><div>Fetching deals from Zoho CRM&hellip;</div></div>`;
     cachedDeals = await fetchAllDeals();
     render(cachedDeals, currentFilter);
+    // Fire blown-in detection in background; re-render when done
+    blownInLoadError = null;
+    fetchBlownInDealIds().then(set => {
+      blownInDealIds = set;
+      if (cachedDeals) render(cachedDeals, currentFilter);
+    });
   } catch (e) {
     log("error", e);
     renderError("Unable to load deals.", e && e.message ? e.message : String(e));
