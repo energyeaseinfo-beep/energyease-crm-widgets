@@ -454,9 +454,35 @@ body {
   align-items: center;
   font-size: 12px;
 }
+/* When year-grouped (has YoY column), 5 columns */
+.intake-row.yoy {
+  grid-template-columns: 180px 80px 1fr 130px 130px;
+}
 .intake-row.header {
   font-weight: 700; color: #64748b; font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.05em; background: #f8fafc;
+}
+.intake-year-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 14px 8px 6px;
+  margin-top: 16px;
+  border-top: 2px solid #1d4ed8;
+  background: linear-gradient(180deg, #f0f6ff 0%, transparent 100%);
+  border-radius: 4px 4px 0 0;
+}
+.intake-year-header:first-of-type { margin-top: 8px; }
+.intake-year-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: #1e40af;
+  letter-spacing: 0.02em;
+}
+.intake-year-stats {
+  font-size: 11px;
+  color: #64748b;
+  text-align: right;
 }
 .intake-label { color: #1e293b; font-weight: 500; }
 .intake-count { text-align: right; font-weight: 700; color: #0f172a; font-size: 14px; }

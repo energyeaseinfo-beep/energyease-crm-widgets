@@ -76,11 +76,11 @@ const FILTERS = [
   { id: "custom", label: "Custom" }
 ];
 
-// Lead Intake granularities
+// Lead Intake granularities. monthly/quarterly use year grouping with YoY.
 const GRANULARITIES = [
-  { id: "weekly", label: "Weekly", buckets: 12 },
-  { id: "monthly", label: "Monthly", buckets: 12 },
-  { id: "quarterly", label: "Quarterly", buckets: 8 },
+  { id: "weekly", label: "Weekly", buckets: 12, grouping: "flat" },
+  { id: "monthly", label: "Monthly", buckets: 24, grouping: "year" },
+  { id: "quarterly", label: "Quarterly", buckets: 8, grouping: "year" },
   { id: "custom", label: "Custom" }
 ];
 
@@ -691,12 +691,58 @@ function computeLeadIntake(deals, granularity) {
     buckets.push({ label, count, start, end });
   }
 
-  // Attach prior-period count (= previous bucket in series)
+  // Attach prior-period count (= previous bucket in series, MoM/WoW/QoQ)
   const withDelta = buckets.map((b, i) => ({
     ...b,
     priorCount: i > 0 ? buckets[i - 1].count : null
   }));
-  return { isCustom: false, buckets: withDelta };
+
+  // Attach YoY count (= bucket from same period 1 year prior, if present in the series)
+  // Only meaningful for monthly + quarterly (year grouping); set null for weekly
+  const cfg = GRANULARITIES.find(g => g.id === granularity) || {};
+  if (cfg.grouping === "year") {
+    withDelta.forEach(b => {
+      if (!b.start) { b.yoyCount = null; return; }
+      const target = withDelta.find(other => {
+        if (!other.start) return false;
+        if (granularity === "monthly") {
+          return other.start.getFullYear() === b.start.getFullYear() - 1 &&
+                 other.start.getMonth() === b.start.getMonth();
+        }
+        if (granularity === "quarterly") {
+          const otherQ = Math.floor(other.start.getMonth() / 3);
+          const bQ = Math.floor(b.start.getMonth() / 3);
+          return other.start.getFullYear() === b.start.getFullYear() - 1 && otherQ === bQ;
+        }
+        return false;
+      });
+      b.yoyCount = target ? target.count : null;
+    });
+  }
+
+  return { isCustom: false, buckets: withDelta, grouping: cfg.grouping || "flat", granularity };
+}
+
+// Group buckets by calendar year (most recent year first)
+function groupBucketsByYear(buckets) {
+  const groups = {};
+  buckets.forEach(b => {
+    if (!b.start) return;
+    const year = b.start.getFullYear();
+    if (!groups[year]) groups[year] = [];
+    groups[year].push(b);
+  });
+  return Object.entries(groups)
+    .map(([year, bs]) => ({
+      year: Number(year),
+      // Within a year: most recent period first
+      buckets: bs.slice().sort((a, b) => b.start - a.start),
+      total: bs.reduce((s, b) => s + b.count, 0),
+      // YoY at year level: sum of YoY values where available (only counts comparable periods)
+      yoySum: bs.reduce((s, b) => s + (b.yoyCount !== null ? b.yoyCount : 0), 0),
+      yoyCoverage: bs.filter(b => b.yoyCount !== null).length
+    }))
+    .sort((a, b) => b.year - a.year);
 }
 
 function deltaHtml(count, prior) {
@@ -724,21 +770,69 @@ function leadIntakeHtml(intake, granularity) {
     </div>`;
   }
 
+  const periodWord = granularity === "weekly" ? "week" : granularity === "monthly" ? "month" : granularity === "quarterly" ? "quarter" : "period";
   let body = "";
+
   if (intake.isCustom) {
     body = `<div class="intake-summary">
       <div class="intake-summary-label">New deals · ${escapeHtml(intake.label)}</div>
       <div class="intake-summary-value">${intake.count}</div>
       <div class="intake-summary-prior">vs ${intake.priorCount} in prior equal period (${escapeHtml(intake.priorLabel)}) ${deltaHtml(intake.count, intake.priorCount)}</div>
     </div>`;
+  } else if (intake.grouping === "year") {
+    // Year-grouped layout with YoY column
+    const yearGroups = groupBucketsByYear(intake.buckets);
+    const maxCount = Math.max(1, ...intake.buckets.map(b => b.count));
+    const totals = intake.buckets.reduce((s, b) => s + b.count, 0);
+    const avg = totals / intake.buckets.length;
+
+    body = `<div class="intake-summary">
+      <div class="intake-summary-label">Total across ${intake.buckets.length} ${periodWord}s shown</div>
+      <div class="intake-summary-value">${totals}</div>
+      <div class="intake-summary-prior">avg ${avg.toFixed(1)} per ${periodWord} · grouped by calendar year · YoY = same period prior year</div>
+    </div>`;
+
+    yearGroups.forEach(yg => {
+      const yearAvg = yg.total / yg.buckets.length;
+      // Year-level YoY: sum of current year buckets that have a YoY comparison vs sum of those prior-year values
+      const yearCurrentMatched = yg.buckets.filter(b => b.yoyCount !== null).reduce((s, b) => s + b.count, 0);
+      const yearYoyDelta = yg.yoyCoverage > 0 ? deltaHtml(yearCurrentMatched, yg.yoySum) : `<span class="delta-flat">no prior-year data</span>`;
+      const yearYoyNote = yg.yoyCoverage > 0
+        ? `vs ${yg.yoySum} in same ${yg.yoyCoverage} ${periodWord}${yg.yoyCoverage === 1 ? "" : "s"} of ${yg.year - 1}: ${yearYoyDelta}`
+        : `<span class="delta-flat">no overlapping data with ${yg.year - 1}</span>`;
+
+      body += `<div class="intake-year-header">
+        <div class="intake-year-title">${yg.year}</div>
+        <div class="intake-year-stats">${yg.total} new deal${yg.total === 1 ? "" : "s"} · avg ${yearAvg.toFixed(1)}/${periodWord} · ${yearYoyNote}</div>
+      </div>
+      <div class="intake-row header yoy">
+        <div>Period</div>
+        <div>New deals</div>
+        <div>Distribution</div>
+        <div>vs prior ${periodWord}</div>
+        <div>vs ${yg.year - 1}</div>
+      </div>`;
+      yg.buckets.forEach(b => {
+        const barPct = (b.count / maxCount) * 100;
+        const yoy = b.yoyCount !== null ? deltaHtml(b.count, b.yoyCount) : `<span class="delta-flat">—</span>`;
+        body += `<div class="intake-row yoy">
+          <div class="intake-label">${escapeHtml(b.label)}</div>
+          <div class="intake-count">${b.count}</div>
+          <div class="intake-bar-container"><div class="intake-bar" style="width:${barPct}%"></div></div>
+          <div class="intake-delta">${deltaHtml(b.count, b.priorCount)}</div>
+          <div class="intake-delta">${yoy}</div>
+        </div>`;
+      });
+    });
   } else {
+    // Flat layout (weekly)
     const maxCount = Math.max(1, ...intake.buckets.map(b => b.count));
     const totals = intake.buckets.reduce((s, b) => s + b.count, 0);
     const avg = totals / intake.buckets.length;
     body = `<div class="intake-summary">
       <div class="intake-summary-label">Total across shown periods</div>
       <div class="intake-summary-value">${totals}</div>
-      <div class="intake-summary-prior">avg ${avg.toFixed(1)} per ${granularity === "weekly" ? "week" : granularity === "monthly" ? "month" : "quarter"}</div>
+      <div class="intake-summary-prior">avg ${avg.toFixed(1)} per ${periodWord}</div>
     </div>
     <div class="intake-row header">
       <div>Period</div>
