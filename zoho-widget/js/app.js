@@ -56,6 +56,116 @@ function renderError(msg, detail) {
     </div>`;
 }
 
+// ============== DRILL-DOWN MODAL ==============
+window.__drillData = window.__drillData || {};
+function registerDrill(key, title, subtitle, deals) {
+  window.__drillData[key] = { title, subtitle, deals };
+}
+
+function renderDrillRow(d) {
+  const owner = (d.Owner && (d.Owner.name || d.Owner.full_name)) || "—";
+  const ref = d.Reference_Number || ("#" + (d.id || "").slice(-4));
+  const name = d.Deal_Name || "(no name)";
+  const stage = d.Stage || "—";
+  const amount = d.Amount ? fmtEur(d.Amount) : "—";
+  const age = ageStr(d);
+  const tagsList = (d.Tag || []).map(t => escapeHtml(t.name)).join(", ") || "—";
+  return `<tr class="drill-row" data-deal-id="${escapeHtml(d.id)}" onclick="window.__openDealInCrm('${escapeHtml(d.id)}')">
+    <td class="drill-ref">${escapeHtml(ref)}</td>
+    <td class="drill-name">${escapeHtml(name)}</td>
+    <td>${escapeHtml(owner)}</td>
+    <td>${escapeHtml(stage)}</td>
+    <td class="num">${amount}</td>
+    <td>${age}</td>
+    <td class="drill-tags">${tagsList}</td>
+  </tr>`;
+}
+
+window.__showDrill = function (key) {
+  const item = window.__drillData[key];
+  if (!item) { log("No drill data for key", key); return; }
+  openDrillModal(item.title, item.subtitle, item.deals);
+};
+
+function openDrillModal(title, subtitle, deals) {
+  let container = document.getElementById("drill-modal-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "drill-modal-container";
+    document.body.appendChild(container);
+  }
+  const sortedDeals = (deals || []).slice().sort((a, b) =>
+    new Date(b.Modified_Time || 0) - new Date(a.Modified_Time || 0)
+  );
+  const totalAmount = sortedDeals.reduce((s, d) => s + (Number(d.Amount) || 0), 0);
+  container.innerHTML = `<div class="modal-overlay" onclick="window.__closeDrill(event)">
+    <div class="modal-card" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div class="modal-titleblock">
+          <h3>${escapeHtml(title)}</h3>
+          <div class="modal-subtitle">${escapeHtml(subtitle || '')}</div>
+          <div class="modal-stats">
+            <span><strong>${sortedDeals.length}</strong> deal${sortedDeals.length === 1 ? '' : 's'}</span>
+            <span>Total amount: <strong>${fmtEur(totalAmount)}</strong></span>
+          </div>
+        </div>
+        <button class="modal-close" onclick="window.__closeDrill()" aria-label="Close">×</button>
+      </div>
+      <div class="modal-controls">
+        <input type="text" class="modal-search" placeholder="🔍 Filter by name, owner, stage, tag…" oninput="window.__filterDrill(this.value)" autofocus>
+      </div>
+      <div class="modal-body">
+        <table class="modal-table">
+          <thead>
+            <tr>
+              <th>Ref</th>
+              <th>Deal Name</th>
+              <th>Owner</th>
+              <th>Stage</th>
+              <th class="num">Amount</th>
+              <th>Age</th>
+              <th>Tags</th>
+            </tr>
+          </thead>
+          <tbody id="modal-tbody">
+            ${sortedDeals.length ? sortedDeals.map(d => renderDrillRow(d)).join('') : '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:20px;">No deals match</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+      <div class="modal-footer">
+        <span class="modal-footer-hint">Click any row to open the deal in Zoho CRM · ESC or click outside to close</span>
+      </div>
+    </div>
+  </div>`;
+  container.style.display = "block";
+  setTimeout(() => {
+    const handler = (e) => {
+      if (e.key === "Escape") {
+        window.__closeDrill();
+        document.removeEventListener("keydown", handler);
+      }
+    };
+    document.addEventListener("keydown", handler);
+  }, 0);
+}
+
+window.__closeDrill = function () {
+  const c = document.getElementById("drill-modal-container");
+  if (c) c.style.display = "none";
+};
+window.__filterDrill = function (query) {
+  const q = (query || "").toLowerCase();
+  document.querySelectorAll("#modal-tbody tr").forEach(tr => {
+    const text = tr.textContent.toLowerCase();
+    tr.style.display = (!q || text.includes(q)) ? "" : "none";
+  });
+};
+window.__openDealInCrm = function (dealId) {
+  if (window.ZOHO && ZOHO.CRM && ZOHO.CRM.UI && ZOHO.CRM.UI.Record) {
+    ZOHO.CRM.UI.Record.open({ Entity: "Deals", RecordID: dealId }).catch(e => log("open error", e));
+  }
+};
+
 function classifyClosedWon(d) {
   if (hasTag(d, "Cetelem Paid Upfront") || hasTag(d, "paid 100%")) return "ok";
   // If first invoice has been paid, treat as ok regardless of whether "First 50% sent" tag was set
@@ -92,10 +202,12 @@ function rowHtml(d, cls) {
   </div>`;
 }
 
-function groupHtml(title, items, cls) {
+function groupHtml(title, items, cls, drillKey) {
   if (!items.length) return "";
+  if (drillKey) registerDrill(drillKey, title, `${items.length} deals in this bucket`, items);
+  const clickable = drillKey ? `clickable" onclick="window.__showDrill('${drillKey}')` : "";
   return `<div class="action-group ${cls}">
-    <div class="action-group-title"><span>${escapeHtml(title)}</span><span class="group-count">${items.length}</span></div>
+    <div class="action-group-title ${clickable}"><span>${escapeHtml(title)}</span><span class="group-count">${items.length}</span></div>
     ${items.map(d => rowHtml(d, cls)).join("")}
   </div>`;
 }
@@ -113,21 +225,25 @@ function panelHtml(stageName, dealsInStage, classifyFn, actionNote) {
     (buckets[c] || buckets.ok).push(d);
   });
   const todo = buckets["invoice-todo"].length + buckets["payment-overdue"].length + buckets["cetelem-pending"].length;
+  const stageKeyName = stageName.replace(/[^a-z0-9]/gi, "_");
+  registerDrill(`stage_${stageKeyName}_all`, `${stageName} — all deals`, `${dealsInStage.length} deals in stage · ${todo} need action`, dealsInStage);
   let html = `<div class="stage-panel">
-    <div class="stage-panel-header">
+    <div class="stage-panel-header clickable" onclick="window.__showDrill('stage_${stageKeyName}_all')">
       <h3>${escapeHtml(stageName)} <span style="font-weight:400; color:#64748b; font-size:11px;">— ${escapeHtml(actionNote)}</span></h3>
       <span class="count">${dealsInStage.length} deals · ${todo} need action</span>
     </div>`;
+  const stageKey = stageName.replace(/[^a-z0-9]/gi, "_");
   html += groupHtml(stageName === "Project Done" ? "Final invoice still to send" : "1st invoice still to send",
-                    buckets["invoice-todo"], "invoice-todo");
-  html += groupHtml("Payment not received yet", buckets["payment-overdue"], "payment-overdue");
+                    buckets["invoice-todo"], "invoice-todo", `stage_${stageKey}_todo`);
+  html += groupHtml("Payment not received yet", buckets["payment-overdue"], "payment-overdue", `stage_${stageKey}_overdue`);
   if (buckets["cetelem-pending"].length) {
+    registerDrill(`stage_${stageKey}_cetelem`, `${stageName} — Awaiting Cetelem approval`, `${buckets["cetelem-pending"].length} deals awaiting Cetelem decision`, buckets["cetelem-pending"]);
     html += `<div class="action-group">
-      <div class="action-group-title" style="color:#1e40af;"><span>Awaiting Cetelem approval</span><span class="group-count" style="background:#3b82f6;">${buckets["cetelem-pending"].length}</span></div>
+      <div class="action-group-title clickable" style="color:#1e40af;" onclick="window.__showDrill('stage_${stageKey}_cetelem')"><span>Awaiting Cetelem approval</span><span class="group-count" style="background:#3b82f6;">${buckets["cetelem-pending"].length}</span></div>
       ${buckets["cetelem-pending"].map(d => rowHtml(d, "warn")).join("")}
     </div>`;
   }
-  if (buckets.ok.length) html += groupHtml("On track", buckets.ok, "ok");
+  if (buckets.ok.length) html += groupHtml("On track", buckets.ok, "ok", `stage_${stageKey}_ok`);
   html += "</div>";
   return html;
 }
@@ -138,13 +254,13 @@ function computeCashSummary(deals) {
   //   - 25/75 ("Paid 25%" or "First 25%" tag) → first invoice = 25%, second = 75%
   //   - default 50/50
   // futureSecond is tracked explicitly per deal (NOT inExecutionValue / 2) so Cetelem deals don't inflate it.
-  let firstOutstandingValue = 0, firstOutstandingCount = 0;
-  let secondOutstandingValue = 0, secondOutstandingCount = 0;
-  let toInvoiceFirstValue = 0, toInvoiceFirstCount = 0;
-  let toInvoiceSecondValue = 0, toInvoiceSecondCount = 0;
-  let inExecutionValue = 0, inExecutionCount = 0;
+  let firstOutstandingValue = 0, firstOutstandingDeals = [];
+  let secondOutstandingValue = 0, secondOutstandingDeals = [];
+  let toInvoiceFirstValue = 0, toInvoiceFirstDeals = [];
+  let toInvoiceSecondValue = 0, toInvoiceSecondDeals = [];
+  let inExecutionValue = 0, inExecutionDeals = [];
   let inExecutionReceived = 0;
-  let futureSecond = 0;
+  let futureSecond = 0, futureSecondDeals = [];
 
   deals.forEach(d => {
     const amt = Number(d.Amount) || 0;
@@ -165,77 +281,85 @@ function computeCashSummary(deals) {
       if (fullPaid) {
         // 100% paid (e.g. Cetelem). Nothing outstanding.
       } else if (!firstSent && !firstPaid) {
-        toInvoiceFirstCount++;
         toInvoiceFirstValue += firstInvoiceAmt;
+        toInvoiceFirstDeals.push(d);
       } else if (firstSent && !firstPaid) {
-        firstOutstandingCount++;
         firstOutstandingValue += firstInvoiceAmt;
+        firstOutstandingDeals.push(d);
       }
     }
     if (stage === "Scheduled Execution" || stage === "Project Started") {
       if (fullPaid) {
-        // 100% upfront — in execution but no future invoice expected
-        inExecutionCount++;
         inExecutionValue += amt;
+        inExecutionDeals.push(d);
         inExecutionReceived += amt;
       } else if (firstPaid) {
-        inExecutionCount++;
         inExecutionValue += amt;
+        inExecutionDeals.push(d);
         inExecutionReceived += firstInvoiceAmt;
         futureSecond += secondInvoiceAmt;
+        futureSecondDeals.push(d);
       } else if (firstSent) {
-        firstOutstandingCount++;
         firstOutstandingValue += firstInvoiceAmt;
+        firstOutstandingDeals.push(d);
       } else {
-        toInvoiceFirstCount++;
         toInvoiceFirstValue += firstInvoiceAmt;
+        toInvoiceFirstDeals.push(d);
       }
     }
     if (stage === "Project Done") {
       if (fullPaid) {
         // 100% paid, project done. Nothing outstanding.
       } else if (!lastSent) {
-        toInvoiceSecondCount++;
         toInvoiceSecondValue += secondInvoiceAmt;
+        toInvoiceSecondDeals.push(d);
       } else if (lastSent) {
-        secondOutstandingCount++;
         secondOutstandingValue += secondInvoiceAmt;
+        secondOutstandingDeals.push(d);
       }
     }
   });
 
   const totalOutstanding = firstOutstandingValue + secondOutstandingValue;
-  const totalOutstandingCount = firstOutstandingCount + secondOutstandingCount;
+  const totalOutstandingDeals = [...firstOutstandingDeals, ...secondOutstandingDeals];
   const toInvoiceNow = toInvoiceFirstValue + toInvoiceSecondValue;
+  const toInvoiceNowDeals = [...toInvoiceFirstDeals, ...toInvoiceSecondDeals];
   const stillToReceive = totalOutstanding + toInvoiceNow + futureSecond;
+  const stillToReceiveDeals = Array.from(new Set([
+    ...totalOutstandingDeals, ...toInvoiceNowDeals, ...futureSecondDeals
+  ]));
 
   return {
-    toInvoiceNow, toInvoiceNowCount: toInvoiceFirstCount + toInvoiceSecondCount,
-    toInvoiceFirstCount, toInvoiceSecondCount,
-    firstOutstandingValue, firstOutstandingCount,
-    secondOutstandingValue, secondOutstandingCount,
-    totalOutstanding, totalOutstandingCount,
-    inExecutionValue, inExecutionCount, inExecutionReceived,
-    futureSecond, stillToReceive
+    toInvoiceNow, toInvoiceNowCount: toInvoiceFirstDeals.length + toInvoiceSecondDeals.length,
+    toInvoiceFirstCount: toInvoiceFirstDeals.length, toInvoiceSecondCount: toInvoiceSecondDeals.length,
+    toInvoiceNowDeals, toInvoiceFirstDeals, toInvoiceSecondDeals,
+    firstOutstandingValue, firstOutstandingCount: firstOutstandingDeals.length, firstOutstandingDeals,
+    secondOutstandingValue, secondOutstandingCount: secondOutstandingDeals.length, secondOutstandingDeals,
+    totalOutstanding, totalOutstandingCount: totalOutstandingDeals.length, totalOutstandingDeals,
+    inExecutionValue, inExecutionCount: inExecutionDeals.length, inExecutionReceived, inExecutionDeals,
+    futureSecond, futureSecondDeals, stillToReceive, stillToReceiveDeals
   };
 }
 
 function outstandingHtml(c) {
+  registerDrill("out_first", "1st invoice outstanding", `${c.firstOutstandingCount} deals · 1st-invoice portion (50% or 25%) sent but not yet paid`, c.firstOutstandingDeals);
+  registerDrill("out_second", "2nd invoice outstanding", `${c.secondOutstandingCount} deals · final-invoice portion sent but not yet paid`, c.secondOutstandingDeals);
+  registerDrill("out_total", "Total outstanding invoices", `${c.totalOutstandingCount} invoices awaiting payment (1st + 2nd combined)`, c.totalOutstandingDeals);
   return `<div class="outstanding-box">
     <h2>💸 Cash summary &mdash; money outstanding</h2>
-    <div class="outstanding-subtitle">Live calculation from Zoho tag data &middot; per-deal split detection (50/50, 25/75, or 100% upfront)</div>
+    <div class="outstanding-subtitle">Live calculation from Zoho tag data &middot; per-deal split detection (50/50, 25/75, or 100% upfront) &middot; click any tile to see underlying deals</div>
     <div class="outstanding-grid">
-      <div class="outstanding-tile first">
+      <div class="outstanding-tile first clickable" onclick="window.__showDrill('out_first')">
         <div class="outstanding-label">1st invoice outstanding</div>
         <div class="outstanding-value">${fmtEur(c.firstOutstandingValue)}</div>
         <div class="outstanding-detail">${c.firstOutstandingCount} deal${c.firstOutstandingCount === 1 ? "" : "s"} &middot; 1st-invoice portion only</div>
       </div>
-      <div class="outstanding-tile second">
+      <div class="outstanding-tile second clickable" onclick="window.__showDrill('out_second')">
         <div class="outstanding-label">2nd invoice outstanding</div>
         <div class="outstanding-value">${fmtEur(c.secondOutstandingValue)}</div>
         <div class="outstanding-detail">${c.secondOutstandingCount} deal${c.secondOutstandingCount === 1 ? "" : "s"} &middot; final-invoice portion only</div>
       </div>
-      <div class="outstanding-tile total">
+      <div class="outstanding-tile total clickable" onclick="window.__showDrill('out_total')">
         <div class="outstanding-label">Total outstanding</div>
         <div class="outstanding-value">${fmtEur(c.totalOutstanding)}</div>
         <div class="outstanding-detail">${c.totalOutstandingCount} invoice${c.totalOutstandingCount === 1 ? "" : "s"} awaiting payment</div>
@@ -248,28 +372,33 @@ function outstandingHtml(c) {
 }
 
 function cashSummaryHtml(c) {
+  registerDrill("cash_to_invoice", "To invoice NOW", `${c.toInvoiceFirstCount}× 1st (Closed Won) + ${c.toInvoiceSecondCount}× final (Project Done) need invoicing`, c.toInvoiceNowDeals);
+  registerDrill("cash_outstanding", "Outstanding invoices", `${c.totalOutstandingCount} invoices sent but not paid`, c.totalOutstandingDeals);
+  registerDrill("cash_inexec", "In execution — contract value", `${c.inExecutionCount} ongoing projects · ${fmtEur(c.inExecutionReceived)} already received of ${fmtEur(c.inExecutionValue)} contract value`, c.inExecutionDeals);
+  registerDrill("cash_future", "After project completion", `${c.futureSecondDeals.length} deals with future 2nd invoice expected (Cetelem-paid deals excluded)`, c.futureSecondDeals);
+  registerDrill("cash_total", "Total still to receive", `Outstanding + to-invoice + future 2nd combined · ${c.stillToReceiveDeals.length} deals total`, c.stillToReceiveDeals);
   return `<div class="cash-summary">
-    <div class="cash-tile action">
+    <div class="cash-tile action clickable" onclick="window.__showDrill('cash_to_invoice')">
       <div class="cash-label">To invoice NOW</div>
       <div class="cash-value">${fmtEur(c.toInvoiceNow)}</div>
       <div class="cash-detail">${c.toInvoiceFirstCount}&times; 1st (Closed Won) + ${c.toInvoiceSecondCount}&times; final (Project Done)</div>
     </div>
-    <div class="cash-tile outstanding">
+    <div class="cash-tile outstanding clickable" onclick="window.__showDrill('cash_outstanding')">
       <div class="cash-label">Outstanding invoices</div>
       <div class="cash-value">${fmtEur(c.totalOutstanding)}</div>
       <div class="cash-detail">${c.totalOutstandingCount} sent, not paid</div>
     </div>
-    <div class="cash-tile in-progress">
+    <div class="cash-tile in-progress clickable" onclick="window.__showDrill('cash_inexec')">
       <div class="cash-label">In execution &mdash; contract value</div>
       <div class="cash-value">${fmtEur(c.inExecutionValue)}</div>
       <div class="cash-detail">${c.inExecutionCount} ongoing project${c.inExecutionCount === 1 ? "" : "s"} &middot; ${fmtEur(c.inExecutionReceived)} already received</div>
     </div>
-    <div class="cash-tile future">
+    <div class="cash-tile future clickable" onclick="window.__showDrill('cash_future')">
       <div class="cash-label">After project completion</div>
       <div class="cash-value">${fmtEur(c.futureSecond)}</div>
       <div class="cash-detail">future invoices (Cetelem-paid deals excluded)</div>
     </div>
-    <div class="cash-tile received">
+    <div class="cash-tile received clickable" onclick="window.__showDrill('cash_total')">
       <div class="cash-label">Total still to receive</div>
       <div class="cash-value">${fmtEur(c.stillToReceive)}</div>
       <div class="cash-detail">Outstanding + to-invoice + future 2nd</div>

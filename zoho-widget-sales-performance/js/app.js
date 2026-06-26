@@ -174,6 +174,151 @@ function ownerLastName(name) {
   return parts.length > 1 ? parts[parts.length - 1] : name;
 }
 
+// ============== DRILL-DOWN MODAL ==============
+// Storage for drill-down data, keyed by string ID. We store the deal list at render-time
+// and look it up by key from the inline onclick, to avoid embedding huge arrays in HTML.
+window.__drillData = window.__drillData || {};
+
+function registerDrill(key, title, subtitle, deals) {
+  window.__drillData[key] = { title, subtitle, deals };
+}
+
+function drillBtn(key, value, ariaLabel) {
+  // Wraps a value in a clickable element that opens the drill-down with the given key.
+  return `<span class="drill-trigger" role="button" tabindex="0" title="Click to see underlying deals" onclick="window.__showDrill('${key}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();window.__showDrill('${key}')}" aria-label="${escapeHtml(ariaLabel || 'Open drill-down')}">${value}</span>`;
+}
+
+function dealOutcomeLabel(d) {
+  if (WON_STAGES.has(d.Stage)) return "Won";
+  if (d.Stage === "Closed Lost") return "Lost (final)";
+  if (d.Stage === "Closed Not Qualified") return "Not qualified";
+  if (d.Stage === "Quote Sent" && daysSince(d.Modified_Time) >= STALE_QUOTE_DAYS) return "Lost (ghosted 21d+)";
+  return "Open";
+}
+
+function outcomeClass(d) {
+  if (WON_STAGES.has(d.Stage)) return "outcome-won";
+  if (LOST_STAGES_RAW.has(d.Stage) || isEffectivelyLost(d)) return "outcome-lost";
+  return "outcome-open";
+}
+
+function renderDrillRow(d) {
+  const owner = (d.Owner && (d.Owner.name || d.Owner.full_name)) || "—";
+  const ref = d.Reference_Number || ("#" + (d.id || "").slice(-4));
+  const name = d.Deal_Name || "(no name)";
+  const source = d.Lead_Source || "—";
+  const stage = d.Stage || "—";
+  const amount = d.Amount ? fmtEur(d.Amount) : "—";
+  const created = d.Created_Time ? new Date(d.Created_Time).toLocaleDateString("en-GB") : "—";
+  return `<tr class="drill-row" data-deal-id="${escapeHtml(d.id)}" onclick="window.__openDealInCrm('${escapeHtml(d.id)}')">
+    <td class="drill-ref">${escapeHtml(ref)}</td>
+    <td class="drill-name">${escapeHtml(name)}</td>
+    <td>${escapeHtml(ownerLastName(owner))}</td>
+    <td>${escapeHtml(source)}</td>
+    <td>${escapeHtml(stage)}</td>
+    <td class="drill-outcome ${outcomeClass(d)}">${escapeHtml(dealOutcomeLabel(d))}</td>
+    <td class="num">${amount}</td>
+    <td>${created}</td>
+  </tr>`;
+}
+
+window.__showDrill = function (key) {
+  const item = window.__drillData[key];
+  if (!item) { log("No drill data for key", key); return; }
+  openDrillModal(item.title, item.subtitle, item.deals);
+};
+
+function openDrillModal(title, subtitle, deals) {
+  let container = document.getElementById("drill-modal-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "drill-modal-container";
+    document.body.appendChild(container);
+  }
+  // Sort by Created_Time desc by default
+  const sortedDeals = (deals || []).slice().sort((a, b) =>
+    new Date(b.Created_Time || 0) - new Date(a.Created_Time || 0)
+  );
+  // Aggregate stats
+  const totalAmount = sortedDeals.reduce((s, d) => s + (Number(d.Amount) || 0), 0);
+  const wonCount = sortedDeals.filter(d => WON_STAGES.has(d.Stage)).length;
+  const lostCount = sortedDeals.filter(d => isEffectivelyLost(d)).length;
+  const openCount = sortedDeals.length - wonCount - lostCount;
+  container.innerHTML = `<div class="modal-overlay" onclick="window.__closeDrill(event)">
+    <div class="modal-card" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div class="modal-titleblock">
+          <h3>${escapeHtml(title)}</h3>
+          <div class="modal-subtitle">${escapeHtml(subtitle || '')}</div>
+          <div class="modal-stats">
+            <span><strong>${sortedDeals.length}</strong> deal${sortedDeals.length === 1 ? '' : 's'}</span>
+            <span class="modal-stat-won">${wonCount} won</span>
+            <span class="modal-stat-lost">${lostCount} lost</span>
+            <span class="modal-stat-open">${openCount} open</span>
+            <span>Total amount: <strong>${fmtEur(totalAmount)}</strong></span>
+          </div>
+        </div>
+        <button class="modal-close" onclick="window.__closeDrill()" aria-label="Close">×</button>
+      </div>
+      <div class="modal-controls">
+        <input type="text" class="modal-search" placeholder="🔍 Filter by name, owner, source, stage…" oninput="window.__filterDrill(this.value)" autofocus>
+      </div>
+      <div class="modal-body">
+        <table class="modal-table">
+          <thead>
+            <tr>
+              <th>Ref</th>
+              <th>Deal Name</th>
+              <th>Owner</th>
+              <th>Source</th>
+              <th>Stage</th>
+              <th>Outcome</th>
+              <th class="num">Amount</th>
+              <th>Created</th>
+            </tr>
+          </thead>
+          <tbody id="modal-tbody">
+            ${sortedDeals.length ? sortedDeals.map(d => renderDrillRow(d)).join('') : '<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:20px;">No deals match</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+      <div class="modal-footer">
+        <span class="modal-footer-hint">Click any row to open the deal in Zoho CRM · ESC or click outside to close</span>
+      </div>
+    </div>
+  </div>`;
+  container.style.display = "block";
+  // ESC key handler
+  setTimeout(() => {
+    const handler = (e) => {
+      if (e.key === "Escape") {
+        window.__closeDrill();
+        document.removeEventListener("keydown", handler);
+      }
+    };
+    document.addEventListener("keydown", handler);
+  }, 0);
+}
+
+window.__closeDrill = function () {
+  const c = document.getElementById("drill-modal-container");
+  if (c) c.style.display = "none";
+};
+
+window.__filterDrill = function (query) {
+  const q = (query || "").toLowerCase();
+  document.querySelectorAll("#modal-tbody tr").forEach(tr => {
+    const text = tr.textContent.toLowerCase();
+    tr.style.display = (!q || text.includes(q)) ? "" : "none";
+  });
+};
+
+window.__openDealInCrm = function (dealId) {
+  if (window.ZOHO && ZOHO.CRM && ZOHO.CRM.UI && ZOHO.CRM.UI.Record) {
+    ZOHO.CRM.UI.Record.open({ Entity: "Deals", RecordID: dealId }).catch(e => log("open error", e));
+  }
+};
+
 // ============== KPIs ==============
 function computeKPIs(deals) {
   const total = deals.length;
@@ -250,9 +395,9 @@ function computeConversionTrend(allDeals) {
   const lastQTo = new Date(lastQYear, lastQIdx * 3 + 3, 0, 23, 59, 59);
 
   return [
-    { label: "This month", sub: monthLabel(thisMonthFrom), ...computeConversionForRange(allDeals, thisMonthFrom, thisMonthTo) },
-    { label: "Last month", sub: monthLabel(lastMonthFrom), ...computeConversionForRange(allDeals, lastMonthFrom, lastMonthTo) },
-    { label: "Last quarter", sub: `Q${lastQIdx + 1} ${lastQYear}`, ...computeConversionForRange(allDeals, lastQFrom, lastQTo) }
+    { label: "This month", sub: monthLabel(thisMonthFrom), from: thisMonthFrom, to: thisMonthTo, ...computeConversionForRange(allDeals, thisMonthFrom, thisMonthTo) },
+    { label: "Last month", sub: monthLabel(lastMonthFrom), from: lastMonthFrom, to: lastMonthTo, ...computeConversionForRange(allDeals, lastMonthFrom, lastMonthTo) },
+    { label: "Last quarter", sub: `Q${lastQIdx + 1} ${lastQYear}`, from: lastQFrom, to: lastQTo, ...computeConversionForRange(allDeals, lastQFrom, lastQTo) }
   ];
 }
 
@@ -260,42 +405,62 @@ function monthLabel(d) {
   return d.toLocaleDateString("en-GB", { month: "short", year: "numeric" });
 }
 
-function kpiHtml(k) {
+function kpiHtml(k, filtered) {
   const avgDeal = k.wonCount > 0 ? k.realisedRevenue / k.wonCount : 0;
+  const advisorDeals = filtered.filter(isAdvisorAttributable);
+  const wonDeals = advisorDeals.filter(d => WON_STAGES.has(d.Stage));
+  const lostDeals = advisorDeals.filter(isEffectivelyLost);
+  const decided = [...wonDeals, ...lostDeals];
+  const inspQualIdx = STAGE_ORDER.indexOf("Inspection Qualified");
+  const reachedInspQual = advisorDeals.filter(d => STAGE_ORDER.indexOf(d.Stage) >= inspQualIdx);
+  const quoteSentIdx = STAGE_ORDER.indexOf("Quote Sent");
+  const reachedQuote = advisorDeals.filter(d => STAGE_ORDER.indexOf(d.Stage) >= quoteSentIdx);
+  const inQuoteSent = advisorDeals.filter(d => d.Stage === "Quote Sent");
+  const wonWithCycle = wonDeals.filter(d => d.Sales_Cycle_Duration && d.Sales_Cycle_Duration > 0);
+
+  // Register drill-downs
+  registerDrill("kpi_projects", "Total projects", "Closed Won, Scheduled Execution, Project Started, Project Done, Project Finalised", wonDeals);
+  registerDrill("kpi_revenue", "Realised revenue", `Total: ${fmtEur(k.realisedRevenue)} from ${wonDeals.length} won deals`, wonDeals);
+  registerDrill("kpi_q2w", "Quote → Won conversion (decided)", `${k.wonCount} won + ${k.lostCount} lost = ${k.wonCount + k.lostCount} decided deals (incl. 21d ghosted Quote Sent)`, decided);
+  registerDrill("kpi_i2w", "Inspection → Won conversion (qualified leads)", `${reachedInspQual.length} deals that reached Inspection Qualified or beyond (incl. still in-flight)`, reachedInspQual);
+  registerDrill("kpi_inqs", "Deals in Quote Sent", "Currently awaiting customer decision", inQuoteSent);
+  registerDrill("kpi_cycle", "Won deals with sales cycle data", `${wonWithCycle.length} won deals with Sales_Cycle_Duration > 0`, wonWithCycle);
+  registerDrill("kpi_l2q", "Reached Quote Sent or beyond", `${reachedQuote.length} of ${advisorDeals.length} advisor deals`, reachedQuote);
+
   return `<div class="kpi-hero-row">
-    <div class="kpi-hero">
+    <div class="kpi-hero clickable" onclick="window.__showDrill('kpi_projects')">
       <div class="kpi-hero-label">Total projects</div>
       <div class="kpi-hero-value">${k.wonCount}</div>
       <div class="kpi-hero-sub">avg ${fmtEur(avgDeal)} per deal</div>
     </div>
-    <div class="kpi-hero">
+    <div class="kpi-hero clickable" onclick="window.__showDrill('kpi_revenue')">
       <div class="kpi-hero-label">Realised revenue</div>
       <div class="kpi-hero-value">${fmtEur(k.realisedRevenue)}</div>
       <div class="kpi-hero-sub">from ${k.wonCount} won deal${k.wonCount === 1 ? "" : "s"}</div>
     </div>
-    <div class="kpi-hero">
+    <div class="kpi-hero clickable" onclick="window.__showDrill('kpi_q2w')">
       <div class="kpi-hero-label">Quote → Won conversion</div>
       <div class="kpi-hero-value">${fmtPct(k.quoteToClose)}</div>
       <div class="kpi-hero-sub">of decided quotes (${k.wonCount} of ${k.wonCount + k.lostCount})</div>
     </div>
-    <div class="kpi-hero">
+    <div class="kpi-hero clickable" onclick="window.__showDrill('kpi_i2w')">
       <div class="kpi-hero-label">Inspection → Won conversion</div>
       <div class="kpi-hero-value">${fmtPct(k.inspectionToWon)}</div>
       <div class="kpi-hero-sub">of qualified leads (${k.wonCount} of ${k.reachedInspQual})</div>
     </div>
   </div>
   <div class="kpi-secondary-row">
-    <div class="kpi-secondary">
+    <div class="kpi-secondary clickable" onclick="window.__showDrill('kpi_inqs')">
       <span class="kpi-secondary-label">In Quote Sent</span>
       <span class="kpi-secondary-value">${k.inQuoteSent}</span>
       <span class="kpi-secondary-sub">awaiting decision</span>
     </div>
-    <div class="kpi-secondary">
+    <div class="kpi-secondary clickable" onclick="window.__showDrill('kpi_cycle')">
       <span class="kpi-secondary-label">Avg sales cycle</span>
       <span class="kpi-secondary-value">${k.avgCycle !== null ? Math.round(k.avgCycle) + "d" : "—"}</span>
       <span class="kpi-secondary-sub">won deals only</span>
     </div>
-    <div class="kpi-secondary">
+    <div class="kpi-secondary clickable" onclick="window.__showDrill('kpi_l2q')">
       <span class="kpi-secondary-label">Lead → Quote</span>
       <span class="kpi-secondary-value">${fmtPct(k.leadToQuote)}</span>
       <span class="kpi-secondary-sub">${k.advisorTotal} advisor deals reached quote</span>
@@ -325,7 +490,7 @@ function computeBlownInStats(deals, blownInSet) {
   return { total, blownInCount, blownInRevenue, otherCount, otherRevenue, sharePct, otherSharePct };
 }
 
-function blownInHtml(stats, isLoading) {
+function blownInHtml(stats, isLoading, filteredDeals, blownInSet) {
   if (isLoading) {
     return `<div class="section">
       <h2>🌬️ Blown-in share of projects</h2>
@@ -344,23 +509,32 @@ function blownInHtml(stats, isLoading) {
   }
   const avgBlownIn = stats.blownInCount > 0 ? stats.blownInRevenue / stats.blownInCount : 0;
   const avgOther = stats.otherCount > 0 ? stats.otherRevenue / stats.otherCount : 0;
+
+  // Register drill-downs
+  const projects = (filteredDeals || []).filter(d => WON_STAGES.has(d.Stage));
+  const blownInDeals = projects.filter(d => blownInSet && blownInSet.has(d.id));
+  const otherDeals = projects.filter(d => !blownInSet || !blownInSet.has(d.id));
+  registerDrill("blown_in", "Blown-in projects", `${blownInDeals.length} projects · ${fmtEur(stats.blownInRevenue)} revenue`, blownInDeals);
+  registerDrill("blown_other", "Projects with other techniques", `${otherDeals.length} projects · ${fmtEur(stats.otherRevenue)} revenue`, otherDeals);
+  registerDrill("blown_total", "All projects", `${projects.length} won + execution + finalised projects`, projects);
+
   return `<div class="section">
     <h2>🌬️ Blown-in share of projects</h2>
-    <div class="subtitle">Project = Closed Won or beyond · classification based on most recent quote's line items · ${stats.total} project${stats.total === 1 ? "" : "s"} analysed</div>
+    <div class="subtitle">Project = Closed Won or beyond · classification based on most recent quote's line items · ${stats.total} project${stats.total === 1 ? "" : "s"} analysed · click any tile to see deals</div>
     <div class="blown-in-grid">
-      <div class="blown-in-tile blown">
+      <div class="blown-in-tile blown clickable" onclick="window.__showDrill('blown_in')">
         <div class="blown-in-label">Blown-in projects</div>
         <div class="blown-in-value">${stats.blownInCount}</div>
         <div class="blown-in-pct">${fmtPct(stats.sharePct)} of total</div>
         <div class="blown-in-detail">${fmtEur(stats.blownInRevenue)} revenue · avg ${fmtEur(avgBlownIn)}/deal</div>
       </div>
-      <div class="blown-in-tile other">
+      <div class="blown-in-tile other clickable" onclick="window.__showDrill('blown_other')">
         <div class="blown-in-label">Other techniques</div>
         <div class="blown-in-value">${stats.otherCount}</div>
         <div class="blown-in-pct">${fmtPct(stats.otherSharePct)} of total</div>
         <div class="blown-in-detail">${fmtEur(stats.otherRevenue)} revenue · avg ${fmtEur(avgOther)}/deal</div>
       </div>
-      <div class="blown-in-tile total">
+      <div class="blown-in-tile total clickable" onclick="window.__showDrill('blown_total')">
         <div class="blown-in-label">Total projects</div>
         <div class="blown-in-value">${stats.total}</div>
         <div class="blown-in-pct">100%</div>
@@ -374,11 +548,28 @@ function blownInHtml(stats, isLoading) {
   </div>`;
 }
 
-function conversionTrendHtml(trend) {
+function conversionTrendHtml(trend, allDeals) {
   const MIN_SAMPLE = 5;
   const fmt = (v) => v === null ? "—" : fmtPct(v);
-  // Compare each cell to the NEXT cell (older period) for arrow direction
-  const renderMetric = (label, value, currentIdx, methodKey, sampleKey, sampleNoun) => {
+
+  // Build deal subsets per trend cell + register drill-downs
+  trend.forEach((t, i) => {
+    // Find deals in period
+    const inRange = (allDeals || []).filter(d => {
+      if (!d.Created_Time) return false;
+      const ct = new Date(d.Created_Time);
+      return ct >= t.from && ct <= t.to;
+    });
+    const advisorDeals = inRange.filter(isAdvisorAttributable);
+    const won = advisorDeals.filter(d => WON_STAGES.has(d.Stage));
+    const lost = advisorDeals.filter(d => isEffectivelyLost(d));
+    const inspQualIdx = STAGE_ORDER.indexOf("Inspection Qualified");
+    const qualified = advisorDeals.filter(d => STAGE_ORDER.indexOf(d.Stage) >= inspQualIdx);
+    registerDrill("trend_" + i + "_m1", `${t.label}: Quote → Won (decided)`, `${t.sub} · ${won.length} won + ${lost.length} lost`, [...won, ...lost]);
+    registerDrill("trend_" + i + "_m2", `${t.label}: Inspection → Won (qualified)`, `${t.sub} · ${qualified.length} qualified leads (incl. in-flight)`, qualified);
+  });
+
+  const renderMetric = (label, value, currentIdx, methodKey, sampleKey, sampleNoun, drillKey) => {
     const isLowConf = trend[currentIdx][sampleKey] < MIN_SAMPLE;
     const prior = trend[currentIdx + 1];
     let deltaHtml = "";
@@ -388,7 +579,7 @@ function conversionTrendHtml(trend) {
       const cls = diff > 0.5 ? "delta-up" : diff < -0.5 ? "delta-down" : "delta-flat";
       deltaHtml = `<span class="trend-arrow ${cls}">${arrow} ${diff > 0 ? "+" : ""}${diff.toFixed(0)}pt</span>`;
     }
-    return `<div class="trend-metric ${isLowConf ? "low-conf" : ""}">
+    return `<div class="trend-metric clickable ${isLowConf ? "low-conf" : ""}" onclick="window.__showDrill('${drillKey}')">
       <div class="trend-metric-label">${escapeHtml(label)}</div>
       <div class="trend-metric-value">${fmt(value)} ${deltaHtml}</div>
       <div class="trend-metric-sub">${trend[currentIdx].wonCount} / ${trend[currentIdx][sampleKey]} ${sampleNoun}${isLowConf ? " · low sample" : ""}</div>
@@ -396,14 +587,14 @@ function conversionTrendHtml(trend) {
   };
   return `<div class="section">
     <h2>📈 Conversion trend</h2>
-    <div class="subtitle">How conversion is moving across periods · uses Created_Time · period filter above does not apply here · ◀ = vs older period · cells with fewer than ${MIN_SAMPLE} decided/qualified deals are dimmed (low confidence)</div>
+    <div class="subtitle">How conversion is moving across periods · uses Created_Time · period filter above does not apply here · ▲▼ = vs older period · cells with fewer than ${MIN_SAMPLE} decided/qualified deals are dimmed (low confidence) · click any cell to see underlying deals</div>
     <div class="trend-grid">
       ${trend.map((t, i) => `<div class="trend-cell">
         <div class="trend-period">${escapeHtml(t.label)}</div>
         <div class="trend-sub">${escapeHtml(t.sub)}</div>
         <div class="trend-metrics">
-          ${renderMetric("Quote → Won", t.m1, i, "m1", "decidedCount", "decided")}
-          ${renderMetric("Inspection → Won", t.m2, i, "m2", "reachedInspQual", "qualified")}
+          ${renderMetric("Quote → Won", t.m1, i, "m1", "decidedCount", "decided", "trend_" + i + "_m1")}
+          ${renderMetric("Inspection → Won", t.m2, i, "m2", "reachedInspQual", "qualified", "trend_" + i + "_m2")}
         </div>
       </div>`).join("")}
     </div>
@@ -447,10 +638,10 @@ function computeLeaderboard(deals) {
   }).sort((a, b) => b.score - a.score);
 }
 
-function leaderboardHtml(leaders) {
+function leaderboardHtml(leaders, allDeals) {
   let html = `<div class="section">
     <h2>🏆 Sales Advisor Leaderboard</h2>
-    <div class="subtitle">Advisor-attributable deals · ranked by revenue × win rate · ghosted Quote Sent (21d+) reclassified as lost</div>
+    <div class="subtitle">Advisor-attributable deals · ranked by revenue × win rate · ghosted Quote Sent (21d+) reclassified as lost · click row to see deals</div>
     <div class="leader-row header">
       <div></div><div>Sales Advisor</div>
       <div>Won</div>
@@ -462,7 +653,12 @@ function leaderboardHtml(leaders) {
   } else {
     leaders.forEach((l, i) => {
       const rankCls = i === 0 ? "gold" : i === 1 ? "silver" : i === 2 ? "bronze" : "";
-      html += `<div class="leader-row">
+      const advisorDeals = (allDeals || []).filter(d =>
+        isAdvisorAttributable(d) && getOwnerName(d) === l.name
+      );
+      const key = `leader_${l.name.replace(/[^a-z0-9]/gi, "_")}`;
+      registerDrill(key, `${ownerLastName(l.name)} — all deals`, `${advisorDeals.length} advisor deals · ${l.won} won · ${l.lost} lost · ${fmtEur(l.revenue)} revenue`, advisorDeals);
+      html += `<div class="leader-row clickable" onclick="window.__showDrill('${key}')">
         <div class="rank ${rankCls}">${i + 1}</div>
         <div class="leader-name">${escapeHtml(ownerLastName(l.name))}</div>
         <div class="leader-stat">${l.won}</div>
@@ -476,7 +672,7 @@ function leaderboardHtml(leaders) {
 }
 
 // ============== TROPHIES ==============
-function trophiesHtml(leaders) {
+function trophiesHtml(leaders, allDeals) {
   if (!leaders.length) return "";
   const minWonForRate = 3;
   const pick = (sortFn, filterFn) => {
@@ -500,16 +696,25 @@ function trophiesHtml(leaders) {
 
   return `<div class="section">
     <h2>🎖️ Trophies</h2>
-    <div class="subtitle">Per-advisor records · min. 3 won deals to qualify for win-rate trophies</div>
+    <div class="subtitle">Per-advisor records · min. 3 won deals to qualify for win-rate trophies · click any trophy to see holder's deals</div>
     <div class="badge-grid">
-      ${trophies.map(t => `<div class="badge">
+      ${trophies.map((t, i) => {
+        // Find holder's deals
+        const holderDeals = (allDeals || []).filter(d => {
+          const owner = getOwnerName(d);
+          return owner && ownerLastName(owner) === t.holder && isAdvisorAttributable(d);
+        });
+        const key = `trophy_${i}_${t.holder.replace(/[^a-z0-9]/gi, "_")}`;
+        registerDrill(key, `${t.title}: ${t.holder}`, t.detail, holderDeals);
+        return `<div class="badge clickable" onclick="window.__showDrill('${key}')">
         <div class="badge-icon">${t.icon}</div>
         <div class="badge-content">
           <div class="badge-title">${t.title}</div>
           <div class="badge-holder">${escapeHtml(t.holder)}</div>
           <div class="badge-detail">${t.detail}</div>
         </div>
-      </div>`).join("")}
+      </div>`;
+      }).join("")}
     </div>
   </div>`;
 }
@@ -531,12 +736,15 @@ function leadSourceHtml(deals) {
 
   let html = `<div class="section">
     <h2>📡 Lead Source ROI</h2>
-    <div class="subtitle">Which sources bring revenue · sorted by revenue</div>
+    <div class="subtitle">Which sources bring revenue · sorted by revenue · click row to see deals</div>
     <div class="source-row header">
       <div>Source</div><div>Total</div><div>Won</div><div>Revenue</div><div>Win %</div>
     </div>`;
   rows.forEach(s => {
-    html += `<div class="source-row">
+    const sourceDeals = deals.filter(d => isAdvisorAttributable(d) && (d.Lead_Source || "Unknown") === s.name);
+    const key = `src_${s.name.replace(/[^a-z0-9]/gi, "_")}`;
+    registerDrill(key, `Lead Source: ${s.name}`, `${s.total} advisor deals · ${s.won} won · ${s.lost} lost · ${fmtEur(s.revenue)} revenue`, sourceDeals);
+    html += `<div class="source-row clickable" onclick="window.__showDrill('${key}')">
       <div class="source-name">${escapeHtml(s.name)}</div>
       <div class="num">${s.total}</div>
       <div class="num">${s.won}</div>
@@ -564,7 +772,7 @@ function funnelHtml(deals) {
 
   let html = `<div class="section">
     <h2>🔻 Conversion Funnel</h2>
-    <div class="subtitle">Stage distribution with Pipeline Rules applied (ghosted Quote Sent reclassified as Closed Lost)</div>
+    <div class="subtitle">Stage distribution with Pipeline Rules applied (ghosted Quote Sent reclassified as Closed Lost) · click row to see deals</div>
     <div class="funnel-row header">
       <div>Stage</div><div>Deals</div><div>% of total</div><div></div>
     </div>`;
@@ -573,7 +781,15 @@ function funnelHtml(deals) {
     const pct = total > 0 ? (c / total * 100) : 0;
     const barPct = maxCount > 0 ? (c / maxCount * 100) : 0;
     const cls = WON_STAGES.has(s) ? "won" : (LOST_STAGES_RAW.has(s) || s === "Closed Not Qualified") ? "lost" : "active";
-    html += `<div class="funnel-row">
+    // For each stage, include deals where current Stage equals the effective stage
+    // (handles ghosted Quote Sent → Closed Lost reclassification)
+    const stageDeals = deals.filter(d => {
+      const effective = (d.Stage === "Quote Sent" && daysSince(d.Modified_Time) >= STALE_QUOTE_DAYS) ? "Closed Lost" : d.Stage;
+      return effective === s;
+    });
+    const key = `funnel_${s.replace(/[^a-z0-9]/gi, "_")}`;
+    registerDrill(key, `Funnel stage: ${s}`, `${c} deals currently in this stage (incl. ghost-reclassified)`, stageDeals);
+    html += `<div class="funnel-row clickable" onclick="window.__showDrill('${key}')">
       <div class="stage-name">${escapeHtml(s)}</div>
       <div class="funnel-count">${c}</div>
       <div class="funnel-pct">${pct.toFixed(1)}%</div>
@@ -598,14 +814,17 @@ function lossReasonsHtml(deals) {
 
   let html = `<div class="section">
     <h2>📉 Loss Reason Distribution</h2>
-    <div class="subtitle">Why deals are lost · ${lostDeals.length} Closed Lost deals analysed</div>
+    <div class="subtitle">Why deals are lost · ${lostDeals.length} Closed Lost deals analysed · click row to see deals</div>
     <div class="loss-row header">
       <div>Reason</div><div>Count</div><div>Distribution</div><div>Type</div>
     </div>`;
   rows.forEach(([reason, count]) => {
     const bucket = LOSS_REASON_BUCKET[reason] || "other";
     const barPct = max > 0 ? (count / max * 100) : 0;
-    html += `<div class="loss-row ${bucket}">
+    const reasonDeals = lostDeals.filter(d => (d.Reason_For_Loss__s || "Unknown") === reason);
+    const key = `loss_${reason.replace(/[^a-z0-9]/gi, "_")}`;
+    registerDrill(key, `Loss reason: ${reason}`, `${count} Closed Lost deals · category: ${bucket}`, reasonDeals);
+    html += `<div class="loss-row clickable ${bucket}" onclick="window.__showDrill('${key}')">
       <div>${escapeHtml(reason)}</div>
       <div style="text-align:right; font-weight:600;">${count}</div>
       <div class="loss-bar-container"><div class="loss-bar" style="width:${barPct}%"></div></div>
@@ -767,7 +986,13 @@ function deltaHtml(count, prior) {
   return `<span class="${cls}">${sign}${diff}${pct}</span>`;
 }
 
-function leadIntakeHtml(intake, granularity) {
+function leadIntakeHtml(intake, granularity, allDeals) {
+  // Helper to get deals in a bucket range
+  const dealsInBucket = (b) => (allDeals || []).filter(d => {
+    if (!d.Created_Time) return false;
+    const ct = new Date(d.Created_Time);
+    return ct >= b.start && ct < b.end;
+  });
   const buttons = GRANULARITIES.map(g =>
     `<button class="filter-btn ${g.id === granularity ? "active" : ""}" onclick="window.__li_setGranularity('${g.id}')">${g.label}</button>`
   ).join("");
@@ -787,7 +1012,16 @@ function leadIntakeHtml(intake, granularity) {
   let body = "";
 
   if (intake.isCustom) {
-    body = `<div class="intake-summary">
+    // Custom: use leadIntakeCustomFrom/To to get the deals
+    const from = new Date(leadIntakeCustomFrom + "T00:00:00");
+    const to = new Date(leadIntakeCustomTo + "T23:59:59");
+    const customDeals = (allDeals || []).filter(d => {
+      if (!d.Created_Time) return false;
+      const ct = new Date(d.Created_Time);
+      return ct >= from && ct <= to;
+    });
+    registerDrill("intake_custom", `Lead Intake · ${intake.label}`, `${customDeals.length} new deals in custom range`, customDeals);
+    body = `<div class="intake-summary clickable" onclick="window.__showDrill('intake_custom')">
       <div class="intake-summary-label">New deals · ${escapeHtml(intake.label)}</div>
       <div class="intake-summary-value">${intake.count}</div>
       <div class="intake-summary-prior">vs ${intake.priorCount} in prior equal period (${escapeHtml(intake.priorLabel)}) ${deltaHtml(intake.count, intake.priorCount)}</div>
@@ -799,7 +1033,11 @@ function leadIntakeHtml(intake, granularity) {
     const totals = intake.buckets.reduce((s, b) => s + b.count, 0);
     const avg = totals / intake.buckets.length;
 
-    body = `<div class="intake-summary">
+    // Summary drill: all deals across all shown buckets
+    const allShownDeals = intake.buckets.flatMap(b => dealsInBucket(b));
+    registerDrill("intake_total", `Lead Intake · total across ${intake.buckets.length} ${periodWord}s`, `${allShownDeals.length} new deals across all shown periods`, allShownDeals);
+
+    body = `<div class="intake-summary clickable" onclick="window.__showDrill('intake_total')">
       <div class="intake-summary-label">Total across ${intake.buckets.length} ${periodWord}s shown</div>
       <div class="intake-summary-value">${totals}</div>
       <div class="intake-summary-prior">avg ${avg.toFixed(1)} per ${periodWord} · grouped by calendar year · YoY = same period prior year</div>
@@ -807,14 +1045,17 @@ function leadIntakeHtml(intake, granularity) {
 
     yearGroups.forEach(yg => {
       const yearAvg = yg.total / yg.buckets.length;
-      // Year-level YoY: sum of current year buckets that have a YoY comparison vs sum of those prior-year values
       const yearCurrentMatched = yg.buckets.filter(b => b.yoyCount !== null).reduce((s, b) => s + b.count, 0);
       const yearYoyDelta = yg.yoyCoverage > 0 ? deltaHtml(yearCurrentMatched, yg.yoySum) : `<span class="delta-flat">no prior-year data</span>`;
       const yearYoyNote = yg.yoyCoverage > 0
         ? `vs ${yg.yoySum} in same ${yg.yoyCoverage} ${periodWord}${yg.yoyCoverage === 1 ? "" : "s"} of ${yg.year - 1}: ${yearYoyDelta}`
         : `<span class="delta-flat">no overlapping data with ${yg.year - 1}</span>`;
 
-      body += `<div class="intake-year-header">
+      // Drill for the entire year
+      const yearDeals = yg.buckets.flatMap(b => dealsInBucket(b));
+      registerDrill(`intake_year_${yg.year}`, `Lead Intake ${yg.year}`, `${yearDeals.length} new deals across ${yg.buckets.length} ${periodWord}${yg.buckets.length === 1 ? '' : 's'}`, yearDeals);
+
+      body += `<div class="intake-year-header clickable" onclick="window.__showDrill('intake_year_${yg.year}')">
         <div class="intake-year-title">${yg.year}</div>
         <div class="intake-year-stats">${yg.total} new deal${yg.total === 1 ? "" : "s"} · avg ${yearAvg.toFixed(1)}/${periodWord} · ${yearYoyNote}</div>
       </div>
@@ -825,10 +1066,12 @@ function leadIntakeHtml(intake, granularity) {
         <div>vs prior ${periodWord}</div>
         <div>vs ${yg.year - 1}</div>
       </div>`;
-      yg.buckets.forEach(b => {
+      yg.buckets.forEach((b, bi) => {
         const barPct = (b.count / maxCount) * 100;
         const yoy = b.yoyCount !== null ? deltaHtml(b.count, b.yoyCount) : `<span class="delta-flat">—</span>`;
-        body += `<div class="intake-row yoy">
+        const drillKey = `intake_${yg.year}_${bi}_${b.label.replace(/[^a-z0-9]/gi, '_')}`;
+        registerDrill(drillKey, `Lead Intake · ${b.label}`, `${b.count} new deal${b.count === 1 ? '' : 's'} created in this period`, dealsInBucket(b));
+        body += `<div class="intake-row yoy clickable" onclick="window.__showDrill('${drillKey}')">
           <div class="intake-label">${escapeHtml(b.label)}</div>
           <div class="intake-count">${b.count}</div>
           <div class="intake-bar-container"><div class="intake-bar" style="width:${barPct}%"></div></div>
@@ -842,7 +1085,9 @@ function leadIntakeHtml(intake, granularity) {
     const maxCount = Math.max(1, ...intake.buckets.map(b => b.count));
     const totals = intake.buckets.reduce((s, b) => s + b.count, 0);
     const avg = totals / intake.buckets.length;
-    body = `<div class="intake-summary">
+    const allShownDeals = intake.buckets.flatMap(b => dealsInBucket(b));
+    registerDrill("intake_total_flat", `Lead Intake · total across ${intake.buckets.length} ${periodWord}s`, `${allShownDeals.length} new deals across all shown periods`, allShownDeals);
+    body = `<div class="intake-summary clickable" onclick="window.__showDrill('intake_total_flat')">
       <div class="intake-summary-label">Total across shown periods</div>
       <div class="intake-summary-value">${totals}</div>
       <div class="intake-summary-prior">avg ${avg.toFixed(1)} per ${periodWord}</div>
@@ -853,9 +1098,11 @@ function leadIntakeHtml(intake, granularity) {
       <div>Distribution</div>
       <div>vs prior period</div>
     </div>`;
-    intake.buckets.forEach(b => {
+    intake.buckets.forEach((b, i) => {
       const barPct = (b.count / maxCount) * 100;
-      body += `<div class="intake-row">
+      const drillKey = `intake_flat_${i}_${b.label.replace(/[^a-z0-9]/gi, '_')}`;
+      registerDrill(drillKey, `Lead Intake · ${b.label}`, `${b.count} new deal${b.count === 1 ? '' : 's'} created in this period`, dealsInBucket(b));
+      body += `<div class="intake-row clickable" onclick="window.__showDrill('${drillKey}')">
         <div class="intake-label">${escapeHtml(b.label)}</div>
         <div class="intake-count">${b.count}</div>
         <div class="intake-bar-container"><div class="intake-bar" style="width:${barPct}%"></div></div>
@@ -924,12 +1171,12 @@ function render(allDeals, filterId) {
     <div class="scope-note">
       <strong>Scope:</strong> Pipeline = Regular · period filter on Created_Time · advisor stats exclude customer-service intake (Inspection Scheduled stage and Tomas Rodrigues as owner) · ghosted Quote Sent (21d+ idle) automatically reclassified as Closed Lost per Pipeline Rules.
     </div>
-    ${kpiHtml(kpis)}
-    ${conversionTrendHtml(trend)}
-    ${blownInHtml(blownIn, blownInLoading)}
-    ${leaderboardHtml(leaders)}
-    ${trophiesHtml(leaders)}
-    ${leadIntakeHtml(intake, leadIntakeGranularity)}
+    ${kpiHtml(kpis, filtered)}
+    ${conversionTrendHtml(trend, pipelineFiltered)}
+    ${blownInHtml(blownIn, blownInLoading, filtered, blownInDealIds)}
+    ${leaderboardHtml(leaders, filtered)}
+    ${trophiesHtml(leaders, filtered)}
+    ${leadIntakeHtml(intake, leadIntakeGranularity, pipelineFiltered)}
     ${leadSourceHtml(filtered)}
     ${funnelHtml(filtered)}
     ${lossReasonsHtml(filtered)}
