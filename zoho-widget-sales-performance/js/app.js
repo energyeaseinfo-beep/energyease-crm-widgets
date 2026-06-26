@@ -261,41 +261,44 @@ function monthLabel(d) {
 }
 
 function kpiHtml(k) {
-  return `<div class="kpi-row">
-    <div class="kpi hero">
-      <div class="kpi-label">Quote → Won conversion</div>
-      <div class="kpi-value">${fmtPct(k.quoteToClose)}</div>
-      <div class="kpi-sub">M1: ${k.wonCount} won / ${k.wonCount + k.lostCount} decided · 21d ghost rule</div>
+  const avgDeal = k.wonCount > 0 ? k.realisedRevenue / k.wonCount : 0;
+  return `<div class="kpi-hero-row">
+    <div class="kpi-hero">
+      <div class="kpi-hero-label">Total projects</div>
+      <div class="kpi-hero-value">${k.wonCount}</div>
+      <div class="kpi-hero-sub">avg ${fmtEur(avgDeal)} per deal</div>
     </div>
-    <div class="kpi hero2">
-      <div class="kpi-label">Inspection → Won conversion</div>
-      <div class="kpi-value">${fmtPct(k.inspectionToWon)}</div>
-      <div class="kpi-sub">M2: ${k.wonCount} won / ${k.reachedInspQual} qualified leads (incl. in-flight)</div>
+    <div class="kpi-hero">
+      <div class="kpi-hero-label">Realised revenue</div>
+      <div class="kpi-hero-value">${fmtEur(k.realisedRevenue)}</div>
+      <div class="kpi-hero-sub">from ${k.wonCount} won deal${k.wonCount === 1 ? "" : "s"}</div>
     </div>
-    <div class="kpi projects">
-      <div class="kpi-label">Total projects</div>
-      <div class="kpi-value">${k.wonCount}</div>
-      <div class="kpi-sub">Closed Won + execution + finalised</div>
+    <div class="kpi-hero">
+      <div class="kpi-hero-label">Quote → Won conversion</div>
+      <div class="kpi-hero-value">${fmtPct(k.quoteToClose)}</div>
+      <div class="kpi-hero-sub">of decided quotes (${k.wonCount} of ${k.wonCount + k.lostCount})</div>
     </div>
-    <div class="kpi revenue">
-      <div class="kpi-label">Realised revenue</div>
-      <div class="kpi-value">${fmtEur(k.realisedRevenue)}</div>
-      <div class="kpi-sub">total of won deals</div>
+    <div class="kpi-hero">
+      <div class="kpi-hero-label">Inspection → Won conversion</div>
+      <div class="kpi-hero-value">${fmtPct(k.inspectionToWon)}</div>
+      <div class="kpi-hero-sub">of qualified leads (${k.wonCount} of ${k.reachedInspQual})</div>
     </div>
-    <div class="kpi win">
-      <div class="kpi-label">Lead → Quote conversion</div>
-      <div class="kpi-value">${fmtPct(k.leadToQuote)}</div>
-      <div class="kpi-sub">${k.advisorTotal} advisor deals total</div>
+  </div>
+  <div class="kpi-secondary-row">
+    <div class="kpi-secondary">
+      <span class="kpi-secondary-label">In Quote Sent</span>
+      <span class="kpi-secondary-value">${k.inQuoteSent}</span>
+      <span class="kpi-secondary-sub">awaiting decision</span>
     </div>
-    <div class="kpi warn">
-      <div class="kpi-label">In Quote Sent</div>
-      <div class="kpi-value">${k.inQuoteSent}</div>
-      <div class="kpi-sub">awaiting decision</div>
+    <div class="kpi-secondary">
+      <span class="kpi-secondary-label">Avg sales cycle</span>
+      <span class="kpi-secondary-value">${k.avgCycle !== null ? Math.round(k.avgCycle) + "d" : "—"}</span>
+      <span class="kpi-secondary-sub">won deals only</span>
     </div>
-    <div class="kpi cycle">
-      <div class="kpi-label">Avg sales cycle</div>
-      <div class="kpi-value">${k.avgCycle !== null ? Math.round(k.avgCycle) + "d" : "—"}</div>
-      <div class="kpi-sub">won deals only</div>
+    <div class="kpi-secondary">
+      <span class="kpi-secondary-label">Lead → Quote</span>
+      <span class="kpi-secondary-value">${fmtPct(k.leadToQuote)}</span>
+      <span class="kpi-secondary-sub">${k.advisorTotal} advisor deals reached quote</span>
     </div>
   </div>`;
 }
@@ -372,25 +375,35 @@ function blownInHtml(stats, isLoading) {
 }
 
 function conversionTrendHtml(trend) {
+  const MIN_SAMPLE = 5;
   const fmt = (v) => v === null ? "—" : fmtPct(v);
+  // Compare each cell to the NEXT cell (older period) for arrow direction
+  const renderMetric = (label, value, currentIdx, methodKey, sampleKey, sampleNoun) => {
+    const isLowConf = trend[currentIdx][sampleKey] < MIN_SAMPLE;
+    const prior = trend[currentIdx + 1];
+    let deltaHtml = "";
+    if (prior && prior[methodKey] !== null && value !== null) {
+      const diff = value - prior[methodKey];
+      const arrow = diff > 0.5 ? "▲" : diff < -0.5 ? "▼" : "▬";
+      const cls = diff > 0.5 ? "delta-up" : diff < -0.5 ? "delta-down" : "delta-flat";
+      deltaHtml = `<span class="trend-arrow ${cls}">${arrow} ${diff > 0 ? "+" : ""}${diff.toFixed(0)}pt</span>`;
+    }
+    return `<div class="trend-metric ${isLowConf ? "low-conf" : ""}">
+      <div class="trend-metric-label">${escapeHtml(label)}</div>
+      <div class="trend-metric-value">${fmt(value)} ${deltaHtml}</div>
+      <div class="trend-metric-sub">${trend[currentIdx].wonCount} / ${trend[currentIdx][sampleKey]} ${sampleNoun}${isLowConf ? " · low sample" : ""}</div>
+    </div>`;
+  };
   return `<div class="section">
     <h2>📈 Conversion trend</h2>
-    <div class="subtitle">Both methods over time · M1 = Quote→Won (decided, 21d rule) · M2 = Inspection→Won (incl. in-flight) · period filter ignored, uses Created_Time</div>
+    <div class="subtitle">How conversion is moving across periods · uses Created_Time · period filter above does not apply here · ◀ = vs older period · cells with fewer than ${MIN_SAMPLE} decided/qualified deals are dimmed (low confidence)</div>
     <div class="trend-grid">
-      ${trend.map(t => `<div class="trend-cell">
+      ${trend.map((t, i) => `<div class="trend-cell">
         <div class="trend-period">${escapeHtml(t.label)}</div>
         <div class="trend-sub">${escapeHtml(t.sub)}</div>
         <div class="trend-metrics">
-          <div class="trend-metric">
-            <div class="trend-metric-label">Quote → Won</div>
-            <div class="trend-metric-value">${fmt(t.m1)}</div>
-            <div class="trend-metric-sub">${t.wonCount} / ${t.decidedCount} decided</div>
-          </div>
-          <div class="trend-metric">
-            <div class="trend-metric-label">Inspection → Won</div>
-            <div class="trend-metric-value">${fmt(t.m2)}</div>
-            <div class="trend-metric-sub">${t.wonCount} / ${t.reachedInspQual} qualified</div>
-          </div>
+          ${renderMetric("Quote → Won", t.m1, i, "m1", "decidedCount", "decided")}
+          ${renderMetric("Inspection → Won", t.m2, i, "m2", "reachedInspQual", "qualified")}
         </div>
       </div>`).join("")}
     </div>
@@ -953,35 +966,32 @@ async function fetchAllDeals() {
 }
 
 // ============== BLOWN-IN DETECTION ==============
-// Two COQL queries: (1) all quotes with deal + created_time, (2) all quoted_items with blown-in products.
-// Then in JS: for each deal find most recent quote, check if it has blown-in items.
-async function coqlAllPages(baseQuery) {
-  if (!window.ZOHO || !ZOHO.CRM || !ZOHO.CRM.API || !ZOHO.CRM.API.coql) {
-    throw new Error("COQL API not available in SDK");
+// Embedded SDK's COQL endpoint doesn't support Quoted_Items module ("module not supported in api").
+// Workaround: use getAllRecords on Quotes + Quoted_Items modules directly. Then JS-side join.
+async function fetchAllRecordsSDK(entity, sortBy) {
+  if (!window.ZOHO || !ZOHO.CRM || !ZOHO.CRM.API || !ZOHO.CRM.API.getAllRecords) {
+    throw new Error("getAllRecords not available in SDK");
   }
   const all = [];
-  let offset = 0;
-  const limit = 200;
+  let page = 1;
   while (true) {
-    const query = `${baseQuery} limit ${offset},${limit}`;
-    const resp = await ZOHO.CRM.API.coql({ select_query: query });
-    const rows = (resp && resp.data) || [];
-    if (!rows.length) break;
-    all.push(...rows);
-    if (rows.length < limit) break;
-    offset += limit;
-    if (offset > 10000) break; // safety
+    const params = { Entity: entity, page, per_page: 200 };
+    if (sortBy) { params.sort_by = sortBy; params.sort_order = "desc"; }
+    const resp = await ZOHO.CRM.API.getAllRecords(params);
+    if (!resp || !resp.data) break;
+    all.push(...resp.data);
+    const more = resp.info && resp.info.more_records;
+    if (!more || resp.data.length < 200) break;
+    page++;
+    if (page > 50) break; // safety: max 10000 records
   }
   return all;
 }
 
 async function fetchBlownInDealIds() {
   try {
-    // Step 1: all Quotes with deal lookup + created time
-    log("Fetching quotes for blown-in detection...");
-    const quotes = await coqlAllPages(
-      "select id, Deal_Name, Created_Time from Quotes where id is not null order by Created_Time desc"
-    );
+    log("Fetching quotes...");
+    const quotes = await fetchAllRecordsSDK("Quotes", "Created_Time");
     log("Fetched", quotes.length, "quotes");
 
     // Build map dealId → most recent quoteId
@@ -996,21 +1006,23 @@ async function fetchBlownInDealIds() {
     });
     log("Built deal→latestQuote map:", Object.keys(dealToLatestQuote).length, "deals");
 
-    // Step 2: all Quoted_Items with blown-in product
-    const productList = BLOWN_IN_PRODUCT_IDS.join(",");
-    const blownInItems = await coqlAllPages(
-      `select id, Parent_Id, Product_Name from Quoted_Items where Product_Name in (${productList})`
-    );
-    log("Fetched", blownInItems.length, "blown-in quoted items");
+    log("Fetching quoted items...");
+    const items = await fetchAllRecordsSDK("Quoted_Items", "Created_Time");
+    log("Fetched", items.length, "quoted items");
 
+    // Filter quoted items to blown-in products and collect their Parent_Id (quote ids)
+    const blownInIdSet = new Set(BLOWN_IN_PRODUCT_IDS.map(String));
     const blownInQuoteIds = new Set();
-    blownInItems.forEach(it => {
-      const pid = it.Parent_Id && (it.Parent_Id.id || it.Parent_Id);
-      if (pid) blownInQuoteIds.add(String(pid));
+    items.forEach(it => {
+      const productId = it.Product_Name && (it.Product_Name.id || it.Product_Name);
+      if (productId && blownInIdSet.has(String(productId))) {
+        const pid = it.Parent_Id && (it.Parent_Id.id || it.Parent_Id);
+        if (pid) blownInQuoteIds.add(String(pid));
+      }
     });
     log("Blown-in quote ids:", blownInQuoteIds.size);
 
-    // Step 3: intersect — deals whose most recent quote is in the blown-in set
+    // Intersect: deals whose most recent quote is in the blown-in set
     const result = new Set();
     Object.entries(dealToLatestQuote).forEach(([dealId, info]) => {
       if (blownInQuoteIds.has(String(info.quoteId))) result.add(dealId);
