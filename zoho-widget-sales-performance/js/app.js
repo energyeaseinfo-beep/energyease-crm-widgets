@@ -46,6 +46,11 @@ let currentFilter = "all";
 let customFrom = null; // ISO date string YYYY-MM-DD
 let customTo = null;
 
+// Lead Intake state (independent of period filter)
+let leadIntakeGranularity = "weekly";
+let leadIntakeCustomFrom = null;
+let leadIntakeCustomTo = null;
+
 // Filter periods (apply to Created_Time)
 const FILTERS = [
   { id: "all", label: "All time" },
@@ -53,6 +58,14 @@ const FILTERS = [
   { id: "q", label: "This Quarter" },
   { id: "90d", label: "Last 90d" },
   { id: "30d", label: "Last 30d" },
+  { id: "custom", label: "Custom" }
+];
+
+// Lead Intake granularities
+const GRANULARITIES = [
+  { id: "weekly", label: "Weekly", buckets: 12 },
+  { id: "monthly", label: "Monthly", buckets: 12 },
+  { id: "quarterly", label: "Quarterly", buckets: 8 },
   { id: "custom", label: "Custom" }
 ];
 
@@ -411,6 +424,172 @@ function lossReasonsHtml(deals) {
   return html;
 }
 
+// ============== LEAD INTAKE ==============
+function ensureLeadIntakeCustomDefaults() {
+  if (!leadIntakeCustomFrom) {
+    const d = new Date(TODAY.getTime() - 30 * 24 * 60 * 60 * 1000);
+    leadIntakeCustomFrom = d.toISOString().slice(0, 10);
+  }
+  if (!leadIntakeCustomTo) {
+    leadIntakeCustomTo = TODAY.toISOString().slice(0, 10);
+  }
+}
+
+// Monday-start week
+function getWeekStart(d) {
+  const dt = new Date(d);
+  const day = dt.getDay(); // 0 = Sunday, 1 = Monday
+  const diff = day === 0 ? -6 : 1 - day;
+  dt.setDate(dt.getDate() + diff);
+  dt.setHours(0, 0, 0, 0);
+  return dt;
+}
+
+function fmtDateShort(d) {
+  return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+}
+
+function computeLeadIntake(deals, granularity) {
+  // Custom: return a single bucket with comparison to prior equal-length period
+  if (granularity === "custom") {
+    ensureLeadIntakeCustomDefaults();
+    const from = new Date(leadIntakeCustomFrom + "T00:00:00");
+    const to = new Date(leadIntakeCustomTo + "T23:59:59");
+    const inPeriod = deals.filter(d => {
+      if (!d.Created_Time) return false;
+      const t = new Date(d.Created_Time);
+      return t >= from && t <= to;
+    });
+    const periodMs = to - from;
+    const priorTo = new Date(from.getTime() - 1);
+    const priorFrom = new Date(priorTo.getTime() - periodMs);
+    const inPrior = deals.filter(d => {
+      if (!d.Created_Time) return false;
+      const t = new Date(d.Created_Time);
+      return t >= priorFrom && t <= priorTo;
+    });
+    return {
+      isCustom: true,
+      label: `${fmtDateShort(from)} → ${fmtDateShort(to)}`,
+      count: inPeriod.length,
+      priorCount: inPrior.length,
+      priorLabel: `${fmtDateShort(priorFrom)} → ${fmtDateShort(priorTo)}`
+    };
+  }
+
+  const numBuckets = (GRANULARITIES.find(g => g.id === granularity) || {}).buckets || 12;
+  const buckets = [];
+  for (let i = 0; i < numBuckets; i++) {
+    let start, end, label;
+    const offset = numBuckets - 1 - i; // i=0 is the oldest bucket, latest at end
+    if (granularity === "weekly") {
+      const ws = getWeekStart(TODAY);
+      ws.setDate(ws.getDate() - 7 * offset);
+      start = new Date(ws);
+      end = new Date(ws);
+      end.setDate(end.getDate() + 7);
+      const lastDay = new Date(end.getTime() - 1);
+      label = `${fmtDateShort(start)} – ${fmtDateShort(lastDay)}`;
+    } else if (granularity === "monthly") {
+      const m = new Date(TODAY.getFullYear(), TODAY.getMonth() - offset, 1);
+      start = new Date(m);
+      end = new Date(m.getFullYear(), m.getMonth() + 1, 1);
+      label = m.toLocaleDateString("en-GB", { month: "short", year: "numeric" });
+    } else if (granularity === "quarterly") {
+      const currentQ = Math.floor(TODAY.getMonth() / 3);
+      const totalQ = TODAY.getFullYear() * 4 + currentQ - offset;
+      const year = Math.floor(totalQ / 4);
+      const q = ((totalQ % 4) + 4) % 4;
+      start = new Date(year, q * 3, 1);
+      end = new Date(year, q * 3 + 3, 1);
+      label = `Q${q + 1} ${year}`;
+    }
+    const count = deals.filter(d => {
+      if (!d.Created_Time) return false;
+      const t = new Date(d.Created_Time);
+      return t >= start && t < end;
+    }).length;
+    buckets.push({ label, count, start, end });
+  }
+
+  // Attach prior-period count (= previous bucket in series)
+  const withDelta = buckets.map((b, i) => ({
+    ...b,
+    priorCount: i > 0 ? buckets[i - 1].count : null
+  }));
+  return { isCustom: false, buckets: withDelta };
+}
+
+function deltaHtml(count, prior) {
+  if (prior === null || prior === undefined) return `<span class="delta-flat">—</span>`;
+  const diff = count - prior;
+  const sign = diff > 0 ? "+" : "";
+  const cls = diff > 0 ? "delta-up" : diff < 0 ? "delta-down" : "delta-flat";
+  const pct = prior > 0 ? ` (${sign}${Math.round(diff / prior * 100)}%)` : "";
+  return `<span class="${cls}">${sign}${diff}${pct}</span>`;
+}
+
+function leadIntakeHtml(intake, granularity) {
+  const buttons = GRANULARITIES.map(g =>
+    `<button class="filter-btn ${g.id === granularity ? "active" : ""}" onclick="window.__li_setGranularity('${g.id}')">${g.label}</button>`
+  ).join("");
+
+  let customRow = "";
+  if (granularity === "custom") {
+    ensureLeadIntakeCustomDefaults();
+    customRow = `<div class="filter-custom-row">
+      <span class="filter-label">From:</span>
+      <input type="date" class="filter-date" value="${leadIntakeCustomFrom}" onchange="window.__li_setCustomDate('from', this.value)" max="${TODAY.toISOString().slice(0,10)}">
+      <span class="filter-label">To:</span>
+      <input type="date" class="filter-date" value="${leadIntakeCustomTo}" onchange="window.__li_setCustomDate('to', this.value)" max="${TODAY.toISOString().slice(0,10)}">
+    </div>`;
+  }
+
+  let body = "";
+  if (intake.isCustom) {
+    body = `<div class="intake-summary">
+      <div class="intake-summary-label">New deals · ${escapeHtml(intake.label)}</div>
+      <div class="intake-summary-value">${intake.count}</div>
+      <div class="intake-summary-prior">vs ${intake.priorCount} in prior equal period (${escapeHtml(intake.priorLabel)}) ${deltaHtml(intake.count, intake.priorCount)}</div>
+    </div>`;
+  } else {
+    const maxCount = Math.max(1, ...intake.buckets.map(b => b.count));
+    const totals = intake.buckets.reduce((s, b) => s + b.count, 0);
+    const avg = totals / intake.buckets.length;
+    body = `<div class="intake-summary">
+      <div class="intake-summary-label">Total across shown periods</div>
+      <div class="intake-summary-value">${totals}</div>
+      <div class="intake-summary-prior">avg ${avg.toFixed(1)} per ${granularity === "weekly" ? "week" : granularity === "monthly" ? "month" : "quarter"}</div>
+    </div>
+    <div class="intake-row header">
+      <div>Period</div>
+      <div>New deals</div>
+      <div>Distribution</div>
+      <div>vs prior period</div>
+    </div>`;
+    intake.buckets.forEach(b => {
+      const barPct = (b.count / maxCount) * 100;
+      body += `<div class="intake-row">
+        <div class="intake-label">${escapeHtml(b.label)}</div>
+        <div class="intake-count">${b.count}</div>
+        <div class="intake-bar-container"><div class="intake-bar" style="width:${barPct}%"></div></div>
+        <div class="intake-delta">${deltaHtml(b.count, b.priorCount)}</div>
+      </div>`;
+    });
+  }
+
+  return `<div class="section">
+    <h2>📥 Lead Intake</h2>
+    <div class="subtitle">New deals created per period · Pipeline = Regular · independent of the period filter above</div>
+    <div class="filter-row" style="margin-bottom:8px;">
+      <span class="filter-label">Granularity:</span>
+      ${buttons}
+    </div>
+    ${customRow}
+    ${body}
+  </div>`;
+}
+
 // ============== FILTER BUTTONS ==============
 function filterButtonsHtml(activeId) {
   const buttons = FILTERS.map(f =>
@@ -440,6 +619,7 @@ function render(allDeals, filterId) {
 
   const kpis = computeKPIs(filtered);
   const leaders = computeLeaderboard(filtered);
+  const intake = computeLeadIntake(pipelineFiltered, leadIntakeGranularity);
   const ts = new Date().toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
   const activeFilterLabel = (FILTERS.find(f => f.id === filterId) || FILTERS[0]).label;
 
@@ -458,6 +638,7 @@ function render(allDeals, filterId) {
     ${kpiHtml(kpis)}
     ${leaderboardHtml(leaders)}
     ${trophiesHtml(leaders)}
+    ${leadIntakeHtml(intake, leadIntakeGranularity)}
     ${leadSourceHtml(filtered)}
     ${funnelHtml(filtered)}
     ${lossReasonsHtml(filtered)}
@@ -521,6 +702,22 @@ window.__sp_setCustomDate = function (which, value) {
     const tmp = customFrom;
     customFrom = customTo;
     customTo = tmp;
+  }
+  if (cachedDeals) render(cachedDeals, currentFilter);
+};
+
+// Lead Intake handlers
+window.__li_setGranularity = function (g) {
+  leadIntakeGranularity = g;
+  if (cachedDeals) render(cachedDeals, currentFilter);
+};
+window.__li_setCustomDate = function (which, value) {
+  if (which === "from") leadIntakeCustomFrom = value;
+  if (which === "to") leadIntakeCustomTo = value;
+  if (leadIntakeCustomFrom && leadIntakeCustomTo && leadIntakeCustomFrom > leadIntakeCustomTo) {
+    const tmp = leadIntakeCustomFrom;
+    leadIntakeCustomFrom = leadIntakeCustomTo;
+    leadIntakeCustomTo = tmp;
   }
   if (cachedDeals) render(cachedDeals, currentFilter);
 };

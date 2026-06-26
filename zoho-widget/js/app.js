@@ -58,16 +58,18 @@ function renderError(msg, detail) {
 
 function classifyClosedWon(d) {
   if (hasTag(d, "Cetelem Paid Upfront") || hasTag(d, "paid 100%")) return "ok";
+  // If first invoice has been paid, treat as ok regardless of whether "First 50% sent" tag was set
+  // (you can't pay an invoice that wasn't sent — handles tag-hygiene inconsistencies)
+  if (hasTag(d, "Paid 50%") || hasTag(d, "Paid 25%")) return "ok";
   if (hasTag(d, "Waiting Cetelem")) return "cetelem-pending";
-  if (!hasTag(d, "First 50% sent")) return "invoice-todo";
-  if (hasTag(d, "First 50% sent") && !hasTag(d, "Paid 50%")) return "payment-overdue";
-  return "ok";
+  if (!hasTag(d, "First 50% sent") && !hasTag(d, "First 25%")) return "invoice-todo";
+  return "payment-overdue";
 }
 
 function classifyScheduled(d) {
   if (hasTag(d, "Cetelem Paid Upfront") || hasTag(d, "paid 100%")) return "ok";
-  if (hasTag(d, "Paid 50%")) return "ok";
-  if (!hasTag(d, "First 50% sent")) return "invoice-todo";
+  if (hasTag(d, "Paid 50%") || hasTag(d, "Paid 25%")) return "ok";
+  if (!hasTag(d, "First 50% sent") && !hasTag(d, "First 25%")) return "invoice-todo";
   return "payment-overdue";
 }
 

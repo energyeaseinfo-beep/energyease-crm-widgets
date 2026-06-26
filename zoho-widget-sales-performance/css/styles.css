@@ -328,6 +328,55 @@ body {
 .loss-row.qualification .loss-bar { background: linear-gradient(90deg, #c4b5fd, #8b5cf6); }
 .loss-row.internal .loss-bar { background: linear-gradient(90deg, #fdba74, #ea580c); }
 
+/* LEAD INTAKE */
+.intake-row {
+  display: grid;
+  grid-template-columns: 180px 80px 1fr 130px;
+  gap: 10px;
+  padding: 6px 8px;
+  border-bottom: 1px solid #f1f5f9;
+  align-items: center;
+  font-size: 12px;
+}
+.intake-row.header {
+  font-weight: 700; color: #64748b; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em; background: #f8fafc;
+}
+.intake-label { color: #1e293b; font-weight: 500; }
+.intake-count { text-align: right; font-weight: 700; color: #0f172a; font-size: 14px; }
+.intake-bar-container {
+  height: 16px;
+  background: #f1f5f9;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.intake-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #60a5fa, #2563eb);
+  border-radius: 3px;
+  transition: width 0.3s;
+}
+.intake-delta { text-align: right; font-weight: 600; font-size: 12px; }
+.delta-up { color: #059669; }
+.delta-down { color: #dc2626; }
+.delta-flat { color: #94a3b8; }
+.intake-summary {
+  background: linear-gradient(135deg, #eff6ff, #dbeafe);
+  border-left: 4px solid #2563eb;
+  border-radius: 6px;
+  padding: 14px 18px;
+  margin-bottom: 12px;
+}
+.intake-summary .intake-summary-value {
+  font-size: 28px; font-weight: 700; color: #0f172a;
+}
+.intake-summary .intake-summary-label {
+  font-size: 11px; color: #1e40af; text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em;
+}
+.intake-summary .intake-summary-prior {
+  font-size: 12px; color: #475569; margin-top: 4px;
+}
+
 @media (max-width: 1100px) {
   .kpi-row { grid-template-columns: repeat(3, 1fr); }
 }
