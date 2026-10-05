@@ -12,7 +12,7 @@ Live action-items widget for Zoho CRM. Replaces the static HTML dashboard's Tab 
 
 The widget runs as an iframe inside Zoho CRM. It uses `ZOHO.CRM.API.getAllRecords({Entity: "Deals", ...})` to fetch deals — no separate auth needed; it inherits the CRM session.
 
-Tag-based classification logic mirrors the existing `cashflow_template.html` from the local dashboard build.
+Cash figures come from the Faturas module (InvoiceXpress documents, synced hourly by the CRM function "EE Faturas Sync") when the current user can read it. Otherwise the widget falls back to tags: the sync tags ("Invoice to send", "Awaiting payment", "Payment overdue", "1st payment received", "paid 100%") and the older manual payment tags.
 
 ## Files
 

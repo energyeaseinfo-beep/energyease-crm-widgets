@@ -425,9 +425,12 @@ body {
 /* CASH SUMMARY */
 .cash-summary {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   gap: 12px;
   margin-bottom: 16px;
+}
+@media (max-width: 1200px) {
+  .cash-summary { grid-template-columns: repeat(3, 1fr); }
 }
 .cash-tile {
   background: white;
@@ -441,6 +444,22 @@ body {
 .cash-tile.in-progress { border-left-color: #2563eb; }
 .cash-tile.future { border-left-color: #7c3aed; }
 .cash-tile.received { border-left-color: #059669; }
+.cash-tile.won { border-left-color: #0891b2; }
+
+/* GREEN FUND (pre-won, waiting for subsidy) */
+.gf-panel { border-left: 4px solid #16a34a; }
+.gf-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(160px, 240px));
+  gap: 12px;
+  padding: 10px 0 0;
+}
+.gf-tile {
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
 .cash-label {
   font-size: 10px;
   color: #64748b;
@@ -465,3 +484,11 @@ body {
   .action-row { grid-template-columns: 50px 1fr 80px 70px; }
   .action-row .age, .action-row .tags { display: none; }
 }
+
+/* Invoice mode */
+.action-group.awaiting .action-group-title { color: #1d4ed8; }
+.action-group.awaiting .group-count { background: #3b82f6; }
+.action-row.awaiting { background: #eff6ff; }
+.action-row.awaiting:hover { background: #dbeafe; }
+.action-row .inv-cell { white-space: nowrap; font-size: 11px; color: #334155; }
+@media (min-width: 901px) { .action-row { grid-template-columns: 60px 1fr 110px 80px 130px 1fr; } }

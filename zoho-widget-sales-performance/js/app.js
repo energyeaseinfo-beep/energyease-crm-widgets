@@ -1,8 +1,15 @@
-/* EnergyEase Sales Performance widget — runs inside Zoho CRM, fetches deals via Embedded App SDK */
+/* EnergyEase Sales Performance widget: runs inside Zoho CRM, fetches deals via Embedded App SDK */
 
 const PIPELINE_FILTER = "Regular";
 const TESTDEAL_IDS = new Set(["680374000007820138", "680374000005010079"]);
-const STALE_QUOTE_DAYS = 21; // Pipeline Rules: ghosted Quote Sent → Closed Lost after 21 days
+// Test deals by name: "ZZ ..." or the word "test" (e.g. "Test Deal - Rule 1 Quote Sent")
+function isTestDeal(r) {
+  const n = r.Deal_Name || "";
+  return TESTDEAL_IDS.has(r.id) || /^ZZ\s/i.test(n) || /\btest\b/i.test(n);
+}
+// Widget rule: Quote Sent with no change for 21+ calendar days counts as lost ("ghosted").
+// Note: the CRM pipeline rule itself closes after 21 working days since the quote date.
+const STALE_QUOTE_DAYS = 21;
 
 // Blown-in product IDs — if the most recent quote of a deal contains any of these as a line item,
 // the deal is classified as a blown-in project. List confirmed by Florian (service items + old inactive).
@@ -22,7 +29,10 @@ const WON_STAGES = new Set([
 const LOST_STAGES_RAW = new Set(["Closed Lost"]);
 // Customer service intake stages — owners on these are intake operators, not advisors
 const CUSTOMER_SERVICE_STAGES = new Set(["Inspection Scheduled"]);
-const CUSTOMER_SERVICE_OWNERS = new Set(["Tomas Rodrigues"]);
+// Owners that are not sales advisors (intake operator, generic company account): kept out of the leaderboard
+const CUSTOMER_SERVICE_OWNERS = new Set(["Tomas Rodrigues", "Geral EnergyEase"]);
+// Open stages that only exist after a quote was sent
+const POSTQUOTE_OPEN_STAGES = new Set(["Quote Sent", "Green Fund", "Negotiation/Review"]);
 
 // Stages by sequence (for funnel)
 const STAGE_ORDER = [
@@ -49,11 +59,12 @@ const LOSS_REASON_BUCKET = {
 };
 
 const root = document.getElementById("root");
-const TODAY = new Date();
+let TODAY = new Date(); // reset on every (re)load so periods and ages stay correct after Refresh
 
 // Filter state
 let cachedDeals = null;
 let currentFilter = "all";
+let periodBasis = "created"; // "created" = Created_Time, "closing" = Closing_Date
 let customFrom = null; // ISO date string YYYY-MM-DD
 let customTo = null;
 
@@ -61,12 +72,20 @@ let customTo = null;
 let blownInDealIds = null;
 let blownInLoadError = null;
 
+// Deals with at least one quote record: null = still loading, Set = loaded
+let quoteDealIds = null;
+let quoteLoadError = null;
+
 // Lead Intake state (independent of period filter)
 let leadIntakeGranularity = "weekly";
 let leadIntakeCustomFrom = null;
 let leadIntakeCustomTo = null;
 
-// Filter periods (apply to Created_Time)
+// Filter periods (apply to Created_Time or Closing_Date, see periodBasis)
+const BASES = [
+  { id: "created", label: "Created date" },
+  { id: "closing", label: "Closing date" }
+];
 const FILTERS = [
   { id: "all", label: "All time" },
   { id: "ytd", label: "YTD" },
@@ -98,28 +117,43 @@ function applyPeriodFilter(deals, filterId) {
   } else if (filterId === "30d") {
     cutoffFrom = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
   } else if (filterId === "custom") {
-    if (customFrom) cutoffFrom = new Date(customFrom + "T00:00:00");
-    if (customTo) cutoffTo = new Date(customTo + "T23:59:59");
+    ensureCustomDefaults(); // otherwise the first click on Custom showed All time
+    cutoffFrom = new Date(customFrom + "T00:00:00");
+    cutoffTo = new Date(customTo + "T23:59:59");
   } else {
     return deals;
   }
+  // Closing_Date can lie in the future (expected date of open deals): the closing basis stops at today
+  if (periodBasis === "closing" && !cutoffTo) cutoffTo = now;
   return deals.filter(d => {
-    if (!d.Created_Time) return false;
-    const t = new Date(d.Created_Time);
+    const t = periodDate(d);
+    if (!t) return false;
     if (cutoffFrom && t < cutoffFrom) return false;
     if (cutoffTo && t > cutoffTo) return false;
     return true;
   });
 }
 
+// The date the period filter looks at: Created_Time, or Closing_Date (won/lost date) when chosen
+function periodDate(d) {
+  if (periodBasis === "closing") return d.Closing_Date ? new Date(d.Closing_Date + "T12:00:00") : null;
+  return d.Created_Time ? new Date(d.Created_Time) : null;
+}
+
+// YYYY-MM-DD in local time (toISOString would give the UTC date)
+function localIso(d) {
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 // Default custom range when first opening Custom: last 30 days
 function ensureCustomDefaults() {
   if (!customFrom) {
     const d = new Date(TODAY.getTime() - 30 * 24 * 60 * 60 * 1000);
-    customFrom = d.toISOString().slice(0, 10);
+    customFrom = localIso(d);
   }
   if (!customTo) {
-    customTo = TODAY.toISOString().slice(0, 10);
+    customTo = localIso(TODAY);
   }
 }
 
@@ -132,6 +166,15 @@ function fmtEur(n) {
 }
 function fmtNum(n) { return (n || 0).toLocaleString("en-US"); }
 function fmtPct(n) { return (n || 0).toFixed(0) + "%"; }
+// null = quote data still loading
+function fmtPctWait(n) {
+  if (n !== null && n !== undefined) return fmtPct(n);
+  return quoteLoadError
+    ? `<span class="loading-dots" title="Quote data could not be loaded">n/a</span>`
+    : `<span class="loading-dots" title="Loading quote data">…</span>`;
+}
+// Text for quote-based counts while quote data is not available
+function quoteWaitText() { return quoteLoadError ? "quote data not available" : "loading quote data…"; }
 function daysSince(dateStr) {
   if (!dateStr) return null;
   const d = new Date(dateStr);
@@ -150,14 +193,43 @@ function renderError(msg, detail) {
   </div>`;
 }
 
-// Apply Pipeline Rules: Quote Sent + Modified > 21 days ago = effectively Closed Lost / No Response
+// Quote Sent with no change for 21+ days
+function isGhosted(d) {
+  if (d.Stage !== "Quote Sent") return false;
+  const days = daysSince(d.Modified_Time);
+  return days !== null && days >= STALE_QUOTE_DAYS;
+}
+
+// Any loss: Closed Lost, or ghosted Quote Sent. Used for outcome labels and the funnel.
 function isEffectivelyLost(d) {
-  if (LOST_STAGES_RAW.has(d.Stage)) return true;
-  if (d.Stage === "Quote Sent") {
-    const days = daysSince(d.Modified_Time);
-    if (days !== null && days >= STALE_QUOTE_DAYS) return true;
-  }
-  return false;
+  return LOST_STAGES_RAW.has(d.Stage) || isGhosted(d);
+}
+
+// Did the deal get a quote? Quote record in CRM, or a stage that only exists after a quote.
+// Returns null while quote data is still loading.
+function hasQuote(d) {
+  if (quoteDealIds === null) return null;
+  return quoteDealIds.has(String(d.id)) || WON_STAGES.has(d.Stage) || POSTQUOTE_OPEN_STAGES.has(d.Stage);
+}
+
+// Lost after a quote: Closed Lost with a quote record, or ghosted Quote Sent.
+// Deals lost before any quote (no show, no answer after inspection) do not count against Quote → Won.
+function isLostAfterQuote(d) {
+  if (isGhosted(d)) return true;
+  if (d.Stage !== "Closed Lost") return false;
+  return quoteDealIds !== null && quoteDealIds.has(String(d.id));
+}
+
+function isQualified(d) {
+  return d.Stage !== "Closed Not Qualified";
+}
+
+// Quote → Won rate for a set of advisor deals; null while quote data loads
+function quoteWinRate(advisorDeals) {
+  if (quoteDealIds === null) return null;
+  const won = advisorDeals.filter(d => WON_STAGES.has(d.Stage)).length;
+  const lost = advisorDeals.filter(isLostAfterQuote).length;
+  return won + lost > 0 ? (won / (won + lost)) * 100 : 0;
 }
 
 function isAdvisorAttributable(d) {
@@ -203,13 +275,13 @@ function outcomeClass(d) {
 }
 
 function renderDrillRow(d) {
-  const owner = (d.Owner && (d.Owner.name || d.Owner.full_name)) || "—";
+  const owner = (d.Owner && (d.Owner.name || d.Owner.full_name)) || "-";
   const ref = d.Reference_Number || ("#" + (d.id || "").slice(-4));
   const name = d.Deal_Name || "(no name)";
-  const source = d.Lead_Source || "—";
-  const stage = d.Stage || "—";
-  const amount = d.Amount ? fmtEur(d.Amount) : "—";
-  const created = d.Created_Time ? new Date(d.Created_Time).toLocaleDateString("en-GB") : "—";
+  const source = d.Lead_Source || "-";
+  const stage = d.Stage || "-";
+  const amount = d.Amount ? fmtEur(d.Amount) : "-";
+  const created = d.Created_Time ? new Date(d.Created_Time).toLocaleDateString("en-GB") : "-";
   return `<tr class="drill-row" data-deal-id="${escapeHtml(d.id)}" onclick="window.__openDealInCrm('${escapeHtml(d.id)}')">
     <td class="drill-ref">${escapeHtml(ref)}</td>
     <td class="drill-name">${escapeHtml(name)}</td>
@@ -320,60 +392,64 @@ window.__openDealInCrm = function (dealId) {
 };
 
 // ============== KPIs ==============
+// Definitions (advisor deals = all deals except stage Inspection Scheduled):
+//   Lead → Quote      = advisor deals that got a quote / advisor deals
+//   Quote → Won       = won / (won + lost after a quote, incl. ghosted Quote Sent)
+//   Inspection → Won  = won / qualified advisor deals (Closed Not Qualified left out; open deals stay in)
 function computeKPIs(deals) {
   const total = deals.length;
   const advisorDeals = deals.filter(isAdvisorAttributable);
   const wonDeals = advisorDeals.filter(d => WON_STAGES.has(d.Stage));
-  const lostDeals = advisorDeals.filter(isEffectivelyLost);
-  const decided = wonDeals.length + lostDeals.length;
+  const quotesReady = quoteDealIds !== null;
+  const lostAfterQuote = quotesReady ? advisorDeals.filter(isLostAfterQuote) : [];
+  const decided = wonDeals.length + lostAfterQuote.length;
 
-  const realisedRevenue = wonDeals.reduce((s, d) => s + (Number(d.Amount) || 0), 0);
+  const wonValue = wonDeals.reduce((s, d) => s + (Number(d.Amount) || 0), 0);
 
-  // Method 1: Quote Sent → Won (decided ratio, with Pipeline Rules 21d ghost)
-  const quoteToClose = decided > 0 ? (wonDeals.length / decided) * 100 : 0;
+  const quoteToClose = quotesReady ? (decided > 0 ? (wonDeals.length / decided) * 100 : 0) : null;
 
-  // Method 2: Inspection Qualified → Won (broader — includes still-in-flight deals)
-  const inspQualIdx = STAGE_ORDER.indexOf("Inspection Qualified");
-  const reachedInspQual = advisorDeals.filter(d => STAGE_ORDER.indexOf(d.Stage) >= inspQualIdx).length;
-  const inspectionToWon = reachedInspQual > 0 ? (wonDeals.length / reachedInspQual) * 100 : 0;
+  const qualified = advisorDeals.filter(isQualified);
+  const inspectionToWon = qualified.length > 0 ? (wonDeals.length / qualified.length) * 100 : 0;
 
-  // Lead → Quote: deals that reached Quote Sent (or beyond) / total advisor deals
-  const reachedQuote = advisorDeals.filter(d => {
-    const seqIdx = STAGE_ORDER.indexOf(d.Stage);
-    const quoteSentIdx = STAGE_ORDER.indexOf("Quote Sent");
-    return seqIdx >= quoteSentIdx;
-  }).length;
-  const leadToQuote = advisorDeals.length > 0 ? (reachedQuote / advisorDeals.length) * 100 : 0;
+  const quoted = quotesReady ? advisorDeals.filter(d => hasQuote(d)) : null;
+  const leadToQuote = quoted ? (advisorDeals.length > 0 ? (quoted.length / advisorDeals.length) * 100 : 0) : null;
 
   // Avg sales cycle (won deals only, where Sales_Cycle_Duration is present)
   const cyclesAll = wonDeals.map(d => d.Sales_Cycle_Duration).filter(c => c && c > 0);
   const avgCycle = cyclesAll.length > 0 ? cyclesAll.reduce((a, b) => a + b, 0) / cyclesAll.length : null;
 
-  const inQuoteSent = advisorDeals.filter(d => d.Stage === "Quote Sent").length;
+  const inQuoteSent = advisorDeals.filter(d => d.Stage === "Quote Sent");
+  const ghosted = inQuoteSent.filter(isGhosted);
 
-  return { total, advisorTotal: advisorDeals.length, wonCount: wonDeals.length, lostCount: lostDeals.length,
-    reachedInspQual, realisedRevenue, quoteToClose, inspectionToWon, leadToQuote, avgCycle, inQuoteSent };
+  return { total, advisorTotal: advisorDeals.length, wonCount: wonDeals.length, lostCount: lostAfterQuote.length,
+    qualifiedCount: qualified.length, quotedCount: quoted ? quoted.length : null, wonValue,
+    quoteToClose, inspectionToWon, leadToQuote, avgCycle,
+    awaitingCount: inQuoteSent.length - ghosted.length, ghostedCount: ghosted.length };
 }
 
-// Compute conversion rates over a specific date range (Created_Time based)
-// Returns { m1, m2, wonCount, decidedCount, reachedInspQual }
-function computeConversionForRange(allDeals, from, to) {
-  const inRange = allDeals.filter(d => {
+// Deals created in a date range (the trend always uses Created_Time)
+function dealsCreatedIn(allDeals, from, to) {
+  return allDeals.filter(d => {
     if (!d.Created_Time) return false;
     const t = new Date(d.Created_Time);
     return t >= from && t <= to;
   });
-  const advisorDeals = inRange.filter(isAdvisorAttributable);
+}
+
+// Conversion rates for deals created in a date range, same definitions as the KPI tiles
+// Returns { m1, m2, wonCount, decidedCount, reachedInspQual }
+function computeConversionForRange(allDeals, from, to) {
+  const advisorDeals = dealsCreatedIn(allDeals, from, to).filter(isAdvisorAttributable);
   const wonDeals = advisorDeals.filter(d => WON_STAGES.has(d.Stage));
-  const lostDeals = advisorDeals.filter(isEffectivelyLost);
+  const quotesReady = quoteDealIds !== null;
+  const lostDeals = quotesReady ? advisorDeals.filter(isLostAfterQuote) : [];
   const decided = wonDeals.length + lostDeals.length;
-  const m1 = decided > 0 ? (wonDeals.length / decided) * 100 : null;
+  const m1 = quotesReady && decided > 0 ? (wonDeals.length / decided) * 100 : null;
 
-  const inspQualIdx = STAGE_ORDER.indexOf("Inspection Qualified");
-  const reachedInspQual = advisorDeals.filter(d => STAGE_ORDER.indexOf(d.Stage) >= inspQualIdx).length;
-  const m2 = reachedInspQual > 0 ? (wonDeals.length / reachedInspQual) * 100 : null;
+  const qualified = advisorDeals.filter(isQualified).length;
+  const m2 = qualified > 0 ? (wonDeals.length / qualified) * 100 : null;
 
-  return { m1, m2, wonCount: wonDeals.length, decidedCount: decided, reachedInspQual };
+  return { m1, m2, wonCount: wonDeals.length, decidedCount: quotesReady ? decided : null, reachedInspQual: qualified };
 }
 
 function computeConversionTrend(allDeals) {
@@ -406,26 +482,33 @@ function monthLabel(d) {
 }
 
 function kpiHtml(k, filtered) {
-  const avgDeal = k.wonCount > 0 ? k.realisedRevenue / k.wonCount : 0;
+  const avgDeal = k.wonCount > 0 ? k.wonValue / k.wonCount : 0;
+  const quotesReady = quoteDealIds !== null;
   const advisorDeals = filtered.filter(isAdvisorAttributable);
   const wonDeals = advisorDeals.filter(d => WON_STAGES.has(d.Stage));
-  const lostDeals = advisorDeals.filter(isEffectivelyLost);
+  const lostDeals = quotesReady ? advisorDeals.filter(isLostAfterQuote) : [];
   const decided = [...wonDeals, ...lostDeals];
-  const inspQualIdx = STAGE_ORDER.indexOf("Inspection Qualified");
-  const reachedInspQual = advisorDeals.filter(d => STAGE_ORDER.indexOf(d.Stage) >= inspQualIdx);
-  const quoteSentIdx = STAGE_ORDER.indexOf("Quote Sent");
-  const reachedQuote = advisorDeals.filter(d => STAGE_ORDER.indexOf(d.Stage) >= quoteSentIdx);
+  const qualified = advisorDeals.filter(isQualified);
+  const quoted = quotesReady ? advisorDeals.filter(d => hasQuote(d)) : [];
   const inQuoteSent = advisorDeals.filter(d => d.Stage === "Quote Sent");
+  const awaiting = inQuoteSent.filter(d => !isGhosted(d));
+  const ghosted = inQuoteSent.filter(isGhosted);
   const wonWithCycle = wonDeals.filter(d => d.Sales_Cycle_Duration && d.Sales_Cycle_Duration > 0);
+  const waitSub = `<span class="loading-dots">${quoteWaitText()}</span>`;
 
   // Register drill-downs
   registerDrill("kpi_projects", "Total projects", "Closed Won, Scheduled Execution, Project Started, Project Done, Project Finalised", wonDeals);
-  registerDrill("kpi_revenue", "Realised revenue", `Total: ${fmtEur(k.realisedRevenue)} from ${wonDeals.length} won deals`, wonDeals);
-  registerDrill("kpi_q2w", "Quote → Won conversion (decided)", `${k.wonCount} won + ${k.lostCount} lost = ${k.wonCount + k.lostCount} decided deals (incl. 21d ghosted Quote Sent)`, decided);
-  registerDrill("kpi_i2w", "Inspection → Won conversion (qualified leads)", `${reachedInspQual.length} deals that reached Inspection Qualified or beyond (incl. still in-flight)`, reachedInspQual);
-  registerDrill("kpi_inqs", "Deals in Quote Sent", "Currently awaiting customer decision", inQuoteSent);
+  registerDrill("kpi_revenue", "Won contract value", `Total: ${fmtEur(k.wonValue)} from ${wonDeals.length} won deals · contract value, not cash received`, wonDeals);
+  registerDrill("kpi_q2w", "Quote → Won conversion", quotesReady
+    ? `${k.wonCount} won + ${k.lostCount} lost after a quote (incl. Quote Sent idle 21d+) · deals lost before a quote are left out`
+    : `${k.wonCount} won deals only · ${quoteWaitText()}`, decided);
+  registerDrill("kpi_i2w", "Inspection → Won conversion", `${k.wonCount} won of ${qualified.length} qualified advisor deals (Closed Not Qualified left out, open deals included)`, qualified);
+  registerDrill("kpi_inqs", "In Quote Sent: awaiting decision", `${awaiting.length} deals changed in the last ${STALE_QUOTE_DAYS} days`, awaiting);
+  registerDrill("kpi_ghost", `In Quote Sent: idle ${STALE_QUOTE_DAYS}d+`, `${ghosted.length} deals with no change for ${STALE_QUOTE_DAYS}+ days · counted as lost in the conversion figures`, ghosted);
   registerDrill("kpi_cycle", "Won deals with sales cycle data", `${wonWithCycle.length} won deals with Sales_Cycle_Duration > 0`, wonWithCycle);
-  registerDrill("kpi_l2q", "Reached Quote Sent or beyond", `${reachedQuote.length} of ${advisorDeals.length} advisor deals`, reachedQuote);
+  registerDrill("kpi_l2q", "Lead → Quote: deals that got a quote", quotesReady
+    ? `${quoted.length} of ${advisorDeals.length} advisor deals have a quote (quote record or a post-quote stage)`
+    : quoteWaitText(), quoted);
 
   return `<div class="kpi-hero-row">
     <div class="kpi-hero clickable" onclick="window.__showDrill('kpi_projects')">
@@ -434,36 +517,41 @@ function kpiHtml(k, filtered) {
       <div class="kpi-hero-sub">avg ${fmtEur(avgDeal)} per deal</div>
     </div>
     <div class="kpi-hero clickable" onclick="window.__showDrill('kpi_revenue')">
-      <div class="kpi-hero-label">Realised revenue</div>
-      <div class="kpi-hero-value">${fmtEur(k.realisedRevenue)}</div>
-      <div class="kpi-hero-sub">from ${k.wonCount} won deal${k.wonCount === 1 ? "" : "s"}</div>
+      <div class="kpi-hero-label">Won contract value</div>
+      <div class="kpi-hero-value">${fmtEur(k.wonValue)}</div>
+      <div class="kpi-hero-sub">${k.wonCount} won deal${k.wonCount === 1 ? "" : "s"} · not cash received</div>
     </div>
     <div class="kpi-hero clickable" onclick="window.__showDrill('kpi_q2w')">
       <div class="kpi-hero-label">Quote → Won conversion</div>
-      <div class="kpi-hero-value">${fmtPct(k.quoteToClose)}</div>
-      <div class="kpi-hero-sub">of decided quotes (${k.wonCount} of ${k.wonCount + k.lostCount})</div>
+      <div class="kpi-hero-value">${fmtPctWait(k.quoteToClose)}</div>
+      <div class="kpi-hero-sub">${quotesReady ? `${k.wonCount} won of ${k.wonCount + k.lostCount} decided quotes` : waitSub}</div>
     </div>
     <div class="kpi-hero clickable" onclick="window.__showDrill('kpi_i2w')">
       <div class="kpi-hero-label">Inspection → Won conversion</div>
       <div class="kpi-hero-value">${fmtPct(k.inspectionToWon)}</div>
-      <div class="kpi-hero-sub">of qualified leads (${k.wonCount} of ${k.reachedInspQual})</div>
+      <div class="kpi-hero-sub">${k.wonCount} won of ${k.qualifiedCount} qualified leads</div>
     </div>
   </div>
   <div class="kpi-secondary-row">
     <div class="kpi-secondary clickable" onclick="window.__showDrill('kpi_inqs')">
       <span class="kpi-secondary-label">In Quote Sent</span>
-      <span class="kpi-secondary-value">${k.inQuoteSent}</span>
+      <span class="kpi-secondary-value">${k.awaitingCount}</span>
       <span class="kpi-secondary-sub">awaiting decision</span>
+    </div>
+    <div class="kpi-secondary clickable" onclick="window.__showDrill('kpi_ghost')">
+      <span class="kpi-secondary-label">Quote Sent, idle ${STALE_QUOTE_DAYS}d+</span>
+      <span class="kpi-secondary-value">${k.ghostedCount}</span>
+      <span class="kpi-secondary-sub">counted as lost</span>
     </div>
     <div class="kpi-secondary clickable" onclick="window.__showDrill('kpi_cycle')">
       <span class="kpi-secondary-label">Avg sales cycle</span>
-      <span class="kpi-secondary-value">${k.avgCycle !== null ? Math.round(k.avgCycle) + "d" : "—"}</span>
+      <span class="kpi-secondary-value">${k.avgCycle !== null ? Math.round(k.avgCycle) + "d" : "-"}</span>
       <span class="kpi-secondary-sub">won deals only</span>
     </div>
     <div class="kpi-secondary clickable" onclick="window.__showDrill('kpi_l2q')">
       <span class="kpi-secondary-label">Lead → Quote</span>
-      <span class="kpi-secondary-value">${fmtPct(k.leadToQuote)}</span>
-      <span class="kpi-secondary-sub">${k.advisorTotal} advisor deals reached quote</span>
+      <span class="kpi-secondary-value">${fmtPctWait(k.leadToQuote)}</span>
+      <span class="kpi-secondary-sub">${quotesReady ? `${k.quotedCount} of ${k.advisorTotal} advisor deals got a quote` : waitSub}</span>
     </div>
   </div>`;
 }
@@ -550,27 +638,29 @@ function blownInHtml(stats, isLoading, filteredDeals, blownInSet) {
 
 function conversionTrendHtml(trend, allDeals) {
   const MIN_SAMPLE = 5;
-  const fmt = (v) => v === null ? "—" : fmtPct(v);
+  const fmt = (v) => v === null ? "-" : fmtPct(v);
 
-  // Build deal subsets per trend cell + register drill-downs
+  // Build deal subsets per trend cell + register drill-downs (same definitions as the KPI tiles)
   trend.forEach((t, i) => {
-    // Find deals in period
-    const inRange = (allDeals || []).filter(d => {
-      if (!d.Created_Time) return false;
-      const ct = new Date(d.Created_Time);
-      return ct >= t.from && ct <= t.to;
-    });
-    const advisorDeals = inRange.filter(isAdvisorAttributable);
+    const advisorDeals = dealsCreatedIn(allDeals || [], t.from, t.to).filter(isAdvisorAttributable);
     const won = advisorDeals.filter(d => WON_STAGES.has(d.Stage));
-    const lost = advisorDeals.filter(d => isEffectivelyLost(d));
-    const inspQualIdx = STAGE_ORDER.indexOf("Inspection Qualified");
-    const qualified = advisorDeals.filter(d => STAGE_ORDER.indexOf(d.Stage) >= inspQualIdx);
-    registerDrill("trend_" + i + "_m1", `${t.label}: Quote → Won (decided)`, `${t.sub} · ${won.length} won + ${lost.length} lost`, [...won, ...lost]);
-    registerDrill("trend_" + i + "_m2", `${t.label}: Inspection → Won (qualified)`, `${t.sub} · ${qualified.length} qualified leads (incl. in-flight)`, qualified);
+    const lost = quoteDealIds === null ? [] : advisorDeals.filter(isLostAfterQuote);
+    const qualified = advisorDeals.filter(isQualified);
+    registerDrill("trend_" + i + "_m1", `${t.label}: Quote → Won`, quoteDealIds === null ? `${t.sub} · ${won.length} won deals only · ${quoteWaitText()}` : `${t.sub} · ${won.length} won + ${lost.length} lost after a quote`, [...won, ...lost]);
+    registerDrill("trend_" + i + "_m2", `${t.label}: Inspection → Won`, `${t.sub} · ${qualified.length} qualified leads (incl. still open)`, qualified);
   });
 
   const renderMetric = (label, value, currentIdx, methodKey, sampleKey, sampleNoun, drillKey) => {
-    const isLowConf = trend[currentIdx][sampleKey] < MIN_SAMPLE;
+    const sample = trend[currentIdx][sampleKey];
+    if (sample === null) {
+      // Quote data not in yet: no rate, no sample size
+      return `<div class="trend-metric">
+      <div class="trend-metric-label">${escapeHtml(label)}</div>
+      <div class="trend-metric-value">${fmtPctWait(null)}</div>
+      <div class="trend-metric-sub">${quoteWaitText()}</div>
+    </div>`;
+    }
+    const isLowConf = sample < MIN_SAMPLE;
     const prior = trend[currentIdx + 1];
     let deltaHtml = "";
     if (prior && prior[methodKey] !== null && value !== null) {
@@ -625,28 +715,37 @@ function computeLeaderboard(deals) {
         stats[name].biggest = amt;
         stats[name].biggestRef = d.Reference_Number || ("#" + (d.id || "").slice(-4));
       }
-    } else if (isEffectivelyLost(d)) {
+    } else if (isLostAfterQuote(d)) {
       stats[name].lost++;
     }
   });
+  const quotesReady = quoteDealIds !== null;
   return Object.entries(stats).map(([name, s]) => {
     const decided = s.won + s.lost;
-    const winRate = decided > 0 ? (s.won / decided) * 100 : 0;
+    const winRate = quotesReady ? (decided > 0 ? (s.won / decided) * 100 : 0) : null;
     const avgCycle = s.cycleN > 0 ? s.cycleSum / s.cycleN : null;
     const avgDealSize = s.won > 0 ? s.revenue / s.won : 0;
-    return { name, ...s, winRate, avgCycle, avgDealSize, score: s.revenue * (winRate / 100) };
+    // Until quote data is in, rank by won value only
+    return { name, ...s, winRate, avgCycle, avgDealSize, score: winRate === null ? s.revenue : s.revenue * (winRate / 100) };
   }).sort((a, b) => b.score - a.score);
 }
 
 function leaderboardHtml(leaders, allDeals) {
+  // Won deals that are not in the leaderboard (non-advisor owners or no owner), so the totals reconcile with the KPI tiles
+  const outside = (allDeals || []).filter(d => isAdvisorAttributable(d) && WON_STAGES.has(d.Stage) &&
+    (!getOwnerName(d) || CUSTOMER_SERVICE_OWNERS.has(getOwnerName(d))));
+  if (outside.length) registerDrill("leader_outside", "Won deals not in the leaderboard", `${outside.length} won deals owned by ${Array.from(CUSTOMER_SERVICE_OWNERS).join(" / ")} or without owner`, outside);
+  const outsideNote = outside.length
+    ? ` · <span class="drill-trigger" role="button" tabindex="0" onclick="window.__showDrill('leader_outside')">${outside.length} won deal${outside.length === 1 ? "" : "s"} of non-advisor owners not shown</span>`
+    : "";
   let html = `<div class="section">
     <h2>🏆 Sales Advisor Leaderboard</h2>
-    <div class="subtitle">Advisor-attributable deals · ranked by revenue × win rate · ghosted Quote Sent (21d+) reclassified as lost · click row to see deals</div>
+    <div class="subtitle">Advisor deals · ranked by won value × win rate · win rate = won / (won + lost after a quote, incl. Quote Sent idle ${STALE_QUOTE_DAYS}d+) · leaves out ${Array.from(CUSTOMER_SERVICE_OWNERS).join(" and ")}${outsideNote} · click row to see deals</div>
     <div class="leader-row header">
       <div></div><div>Sales Advisor</div>
       <div>Won</div>
-      <div>Revenue</div>
-      <div>Q→Close %</div>
+      <div>Won value</div>
+      <div>Q→Won %</div>
     </div>`;
   if (!leaders.length) {
     html += `<div style="padding:14px; color:#94a3b8; text-align:center;">No advisor deals.</div>`;
@@ -657,13 +756,13 @@ function leaderboardHtml(leaders, allDeals) {
         isAdvisorAttributable(d) && getOwnerName(d) === l.name
       );
       const key = `leader_${l.name.replace(/[^a-z0-9]/gi, "_")}`;
-      registerDrill(key, `${ownerLastName(l.name)} — all deals`, `${advisorDeals.length} advisor deals · ${l.won} won · ${l.lost} lost · ${fmtEur(l.revenue)} revenue`, advisorDeals);
+      registerDrill(key, `${ownerLastName(l.name)}: all deals`, `${advisorDeals.length} advisor deals · ${l.won} won · ${l.winRate === null ? quoteWaitText() : l.lost + " lost after a quote"} · ${fmtEur(l.revenue)} won value`, advisorDeals);
       html += `<div class="leader-row clickable" onclick="window.__showDrill('${key}')">
         <div class="rank ${rankCls}">${i + 1}</div>
         <div class="leader-name">${escapeHtml(ownerLastName(l.name))}</div>
         <div class="leader-stat">${l.won}</div>
         <div class="leader-stat">${fmtEur(l.revenue)}</div>
-        <div class="leader-stat">${fmtPct(l.winRate)}</div>
+        <div class="leader-stat">${fmtPctWait(l.winRate)}</div>
       </div>`;
     });
   }
@@ -683,11 +782,11 @@ function trophiesHtml(leaders, allDeals) {
   const mw = pick((a, b) => b.won - a.won, x => x.won > 0);
   if (mw) trophies.push({ icon: "🏆", title: "Most deals won", holder: ownerLastName(mw.name), detail: `${mw.won} won · ${fmtEur(mw.revenue)}` });
   const hr = pick((a, b) => b.revenue - a.revenue, x => x.revenue > 0);
-  if (hr) trophies.push({ icon: "💰", title: "Highest revenue", holder: ownerLastName(hr.name), detail: `${fmtEur(hr.revenue)} across ${hr.won} deals` });
+  if (hr) trophies.push({ icon: "💰", title: "Highest won value", holder: ownerLastName(hr.name), detail: `${fmtEur(hr.revenue)} across ${hr.won} deals` });
   let bg = null;
   leaders.forEach(s => { if (s.biggest > 0 && (!bg || s.biggest > bg.biggest)) bg = s; });
-  if (bg) trophies.push({ icon: "💎", title: "Biggest single deal", holder: ownerLastName(bg.name), detail: `${fmtEur(bg.biggest)} (${bg.biggestRef || "—"})` });
-  const br = pick((a, b) => b.winRate - a.winRate, x => x.won >= minWonForRate);
+  if (bg) trophies.push({ icon: "💎", title: "Biggest single deal", holder: ownerLastName(bg.name), detail: `${fmtEur(bg.biggest)} (${bg.biggestRef || "-"})` });
+  const br = pick((a, b) => b.winRate - a.winRate, x => x.won >= minWonForRate && x.winRate !== null);
   if (br) trophies.push({ icon: "🎯", title: "Best win rate", holder: ownerLastName(br.name), detail: `${fmtPct(br.winRate)} (${br.won}/${br.won + br.lost})` });
   const fc = pick((a, b) => a.avgCycle - b.avgCycle, x => x.avgCycle !== null && x.won >= minWonForRate);
   if (fc) trophies.push({ icon: "⚡", title: "Fastest closer", holder: ownerLastName(fc.name), detail: `${Math.round(fc.avgCycle)}d avg cycle (${fc.won} won)` });
@@ -727,29 +826,30 @@ function leadSourceHtml(deals) {
     if (!sources[src]) sources[src] = { total: 0, won: 0, lost: 0, revenue: 0 };
     sources[src].total++;
     if (WON_STAGES.has(d.Stage)) { sources[src].won++; sources[src].revenue += Number(d.Amount) || 0; }
-    else if (isEffectivelyLost(d)) sources[src].lost++;
+    else if (isLostAfterQuote(d)) sources[src].lost++;
   });
+  const quotesReady = quoteDealIds !== null;
   const rows = Object.entries(sources).map(([name, s]) => {
     const decided = s.won + s.lost;
-    return { name, ...s, winRate: decided > 0 ? (s.won / decided) * 100 : 0 };
+    return { name, ...s, winRate: quotesReady ? (decided > 0 ? (s.won / decided) * 100 : 0) : null };
   }).sort((a, b) => b.revenue - a.revenue);
 
   let html = `<div class="section">
     <h2>📡 Lead Source ROI</h2>
-    <div class="subtitle">Which sources bring revenue · sorted by revenue · click row to see deals</div>
+    <div class="subtitle">Which sources bring won business · sorted by won value · win % = Quote → Won · click row to see deals</div>
     <div class="source-row header">
-      <div>Source</div><div>Total</div><div>Won</div><div>Revenue</div><div>Win %</div>
+      <div>Source</div><div>Total</div><div>Won</div><div>Won value</div><div>Win %</div>
     </div>`;
   rows.forEach(s => {
     const sourceDeals = deals.filter(d => isAdvisorAttributable(d) && (d.Lead_Source || "Unknown") === s.name);
     const key = `src_${s.name.replace(/[^a-z0-9]/gi, "_")}`;
-    registerDrill(key, `Lead Source: ${s.name}`, `${s.total} advisor deals · ${s.won} won · ${s.lost} lost · ${fmtEur(s.revenue)} revenue`, sourceDeals);
+    registerDrill(key, `Lead Source: ${s.name}`, `${s.total} advisor deals · ${s.won} won · ${s.winRate === null ? quoteWaitText() : s.lost + " lost after a quote"} · ${fmtEur(s.revenue)} won value`, sourceDeals);
     html += `<div class="source-row clickable" onclick="window.__showDrill('${key}')">
       <div class="source-name">${escapeHtml(s.name)}</div>
       <div class="num">${s.total}</div>
       <div class="num">${s.won}</div>
       <div class="num">${fmtEur(s.revenue)}</div>
-      <div class="num">${fmtPct(s.winRate)}</div>
+      <div class="num">${fmtPctWait(s.winRate)}</div>
     </div>`;
   });
   html += "</div>";
@@ -839,10 +939,10 @@ function lossReasonsHtml(deals) {
 function ensureLeadIntakeCustomDefaults() {
   if (!leadIntakeCustomFrom) {
     const d = new Date(TODAY.getTime() - 30 * 24 * 60 * 60 * 1000);
-    leadIntakeCustomFrom = d.toISOString().slice(0, 10);
+    leadIntakeCustomFrom = localIso(d);
   }
   if (!leadIntakeCustomTo) {
-    leadIntakeCustomTo = TODAY.toISOString().slice(0, 10);
+    leadIntakeCustomTo = localIso(TODAY);
   }
 }
 
@@ -978,7 +1078,7 @@ function groupBucketsByYear(buckets) {
 }
 
 function deltaHtml(count, prior) {
-  if (prior === null || prior === undefined) return `<span class="delta-flat">—</span>`;
+  if (prior === null || prior === undefined) return `<span class="delta-flat">-</span>`;
   const diff = count - prior;
   const sign = diff > 0 ? "+" : "";
   const cls = diff > 0 ? "delta-up" : diff < 0 ? "delta-down" : "delta-flat";
@@ -1002,9 +1102,9 @@ function leadIntakeHtml(intake, granularity, allDeals) {
     ensureLeadIntakeCustomDefaults();
     customRow = `<div class="filter-custom-row">
       <span class="filter-label">From:</span>
-      <input type="date" class="filter-date" value="${leadIntakeCustomFrom}" onchange="window.__li_setCustomDate('from', this.value)" max="${TODAY.toISOString().slice(0,10)}">
+      <input type="date" class="filter-date" value="${leadIntakeCustomFrom}" onchange="window.__li_setCustomDate('from', this.value)" max="${localIso(TODAY)}">
       <span class="filter-label">To:</span>
-      <input type="date" class="filter-date" value="${leadIntakeCustomTo}" onchange="window.__li_setCustomDate('to', this.value)" max="${TODAY.toISOString().slice(0,10)}">
+      <input type="date" class="filter-date" value="${leadIntakeCustomTo}" onchange="window.__li_setCustomDate('to', this.value)" max="${localIso(TODAY)}">
     </div>`;
   }
 
@@ -1068,7 +1168,7 @@ function leadIntakeHtml(intake, granularity, allDeals) {
       </div>`;
       yg.buckets.forEach((b, bi) => {
         const barPct = (b.count / maxCount) * 100;
-        const yoy = b.yoyCount !== null ? deltaHtml(b.count, b.yoyCount) : `<span class="delta-flat">—</span>`;
+        const yoy = b.yoyCount !== null ? deltaHtml(b.count, b.yoyCount) : `<span class="delta-flat">-</span>`;
         const drillKey = `intake_${yg.year}_${bi}_${b.label.replace(/[^a-z0-9]/gi, '_')}`;
         registerDrill(drillKey, `Lead Intake · ${b.label}`, `${b.count} new deal${b.count === 1 ? '' : 's'} created in this period`, dealsInBucket(b));
         body += `<div class="intake-row yoy clickable" onclick="window.__showDrill('${drillKey}')">
@@ -1128,19 +1228,24 @@ function filterButtonsHtml(activeId) {
   const buttons = FILTERS.map(f =>
     `<button class="filter-btn ${f.id === activeId ? "active" : ""}" onclick="window.__sp_setFilter('${f.id}')">${f.label}</button>`
   ).join("");
+  const basisButtons = BASES.map(b =>
+    `<button class="filter-btn ${b.id === periodBasis ? "active" : ""}" onclick="window.__sp_setBasis('${b.id}')">${b.label}</button>`
+  ).join("");
   let customRow = "";
   if (activeId === "custom") {
     ensureCustomDefaults();
     customRow = `<div class="filter-custom-row">
       <span class="filter-label">From:</span>
-      <input type="date" class="filter-date" value="${customFrom}" onchange="window.__sp_setCustomDate('from', this.value)" max="${TODAY.toISOString().slice(0,10)}">
+      <input type="date" class="filter-date" value="${customFrom}" onchange="window.__sp_setCustomDate('from', this.value)" max="${localIso(TODAY)}">
       <span class="filter-label">To:</span>
-      <input type="date" class="filter-date" value="${customTo}" onchange="window.__sp_setCustomDate('to', this.value)" max="${TODAY.toISOString().slice(0,10)}">
+      <input type="date" class="filter-date" value="${customTo}" onchange="window.__sp_setCustomDate('to', this.value)" max="${localIso(TODAY)}">
     </div>`;
   }
   return `<div class="filter-row">
     <span class="filter-label">Period:</span>
     ${buttons}
+    <span class="filter-label" style="margin-left:12px;" title="Created date: deals that came in during the period. Closing date: the CRM field Closing Date (normally the won or lost date, an expected date for open deals), up to today.">By:</span>
+    ${basisButtons}
   </div>${customRow}`;
 }
 
@@ -1158,19 +1263,33 @@ function render(allDeals, filterId) {
   const blownInLoading = blownInDealIds === null && !blownInLoadError;
   const ts = new Date().toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
   const activeFilterLabel = (FILTERS.find(f => f.id === filterId) || FILTERS[0]).label;
+  const basisLabel = periodBasis === "closing" ? "by closing date" : "by created date";
+  let quoteNote = quoteLoadError
+    ? `<div class="scope-note" style="border-color:#fca5a5;background:#fef2f2;"><strong>Quote data could not be loaded:</strong> ${escapeHtml(quoteLoadError)}. Quote-based figures are not shown.</div>`
+    : "";
+  if (periodBasis === "closing" && filterId !== "all") {
+    // Won or lost deals whose Closing Date still lies in the future fall outside every closing-date period
+    const closedFuture = pipelineFiltered.filter(d => (WON_STAGES.has(d.Stage) || LOST_STAGES_RAW.has(d.Stage)) &&
+      d.Closing_Date && new Date(d.Closing_Date + "T12:00:00") > TODAY);
+    if (closedFuture.length) {
+      registerDrill("closing_future", "Closed deals with a Closing Date after today", `${closedFuture.length} won or lost deals · not counted by closing date until the Closing Date is corrected in CRM`, closedFuture);
+      quoteNote += `<div class="scope-note" style="border-color:#fcd34d;background:#fffbeb;"><strong>Closing date check:</strong> ${drillBtn("closing_future", `${closedFuture.filter(d => WON_STAGES.has(d.Stage)).length} won and ${closedFuture.filter(d => LOST_STAGES_RAW.has(d.Stage)).length} lost deals`, "Closed deals with a future Closing Date")} have a Closing Date after today, so they are not counted here. Correct the Closing Date in CRM to include them.</div>`;
+    }
+  }
 
   const html = `
     <div class="header">
       <div>
         <h1>Sales Performance</h1>
-        <div class="meta">Live from Zoho CRM · ${filtered.length} deals (${activeFilterLabel}) · refreshed ${ts}</div>
+        <div class="meta">Live from Zoho CRM · ${filtered.length} deals (${activeFilterLabel}${filterId === "all" ? "" : ", " + basisLabel}) · refreshed ${ts}</div>
       </div>
       <button class="refresh-btn" onclick="window.__sp_refresh()">Refresh</button>
     </div>
     ${filterButtonsHtml(filterId)}
     <div class="scope-note">
-      <strong>Scope:</strong> Pipeline = Regular · period filter on Created_Time · advisor stats exclude customer-service intake (Inspection Scheduled stage and Tomas Rodrigues as owner) · ghosted Quote Sent (21d+ idle) automatically reclassified as Closed Lost per Pipeline Rules.
+      <strong>Scope:</strong> Pipeline = Regular (Northern Branch and B2B not included) · period on created date or closing date (toggle) · advisor deals leave out the intake stage Inspection Scheduled · Quote Sent with no change for ${STALE_QUOTE_DAYS}+ days counts as lost · test deals left out.
     </div>
+    ${quoteNote}
     ${kpiHtml(kpis, filtered)}
     ${conversionTrendHtml(trend, pipelineFiltered)}
     ${blownInHtml(blownIn, blownInLoading, filtered, blownInDealIds)}
@@ -1201,7 +1320,7 @@ async function fetchAllDeals() {
       per_page: perPage
     });
     if (!resp || !resp.data) break;
-    const rows = resp.data.filter(r => !TESTDEAL_IDS.has(r.id));
+    const rows = resp.data.filter(r => !isTestDeal(r));
     all.push(...rows);
     const more = resp.info && resp.info.more_records;
     if (!more || resp.data.length < perPage) break;
@@ -1235,12 +1354,28 @@ async function fetchAllRecordsSDK(entity, sortBy) {
   return all;
 }
 
-async function fetchBlownInDealIds() {
+// Fetches all quotes once. Hands the set of deals with a quote record to onQuotes (conversion
+// figures), then continues with the quote line items for the blown-in share.
+// Writes no global state itself, so an older load can never overwrite a newer one.
+// Resolves to { set } (blown-in deal ids), { error } (line items failed) or { quoteError }.
+async function fetchQuoteData(onQuotes) {
+  let quotes;
   try {
     log("Fetching quotes...");
-    const quotes = await fetchAllRecordsSDK("Quotes", "Created_Time");
+    quotes = await fetchAllRecordsSDK("Quotes", "Created_Time");
     log("Fetched", quotes.length, "quotes");
+  } catch (e) {
+    log("Quote fetch failed:", e);
+    return { quoteError: e && e.message ? e.message : String(e) };
+  }
+  const ids = new Set(quotes.filter(q => q.Deal_Name && q.Deal_Name.id).map(q => String(q.Deal_Name.id)));
+  log("Deals with a quote:", ids.size);
+  onQuotes(ids);
+  return fetchBlownInDealIds(quotes);
+}
 
+async function fetchBlownInDealIds(quotes) {
+  try {
     // Build map dealId → most recent quoteId
     const dealToLatestQuote = {};
     quotes.forEach(q => {
@@ -1275,23 +1410,35 @@ async function fetchBlownInDealIds() {
       if (blownInQuoteIds.has(String(info.quoteId))) result.add(dealId);
     });
     log("Blown-in deals found:", result.size);
-    return result;
+    return { set: result };
   } catch (e) {
     log("Blown-in detection failed:", e);
-    blownInLoadError = e && e.message ? e.message : String(e);
-    return null;
+    return { error: e && e.message ? e.message : String(e) };
   }
 }
 
+let loadSeq = 0; // ignores results of an older load when Refresh is pressed again
 async function loadAndRender() {
+  const seq = ++loadSeq;
   try {
+    TODAY = new Date();
     root.innerHTML = `<div class="loading-state"><div class="spinner"></div><div>Fetching deals from Zoho CRM&hellip;</div></div>`;
-    cachedDeals = await fetchAllDeals();
+    const deals = await fetchAllDeals();
+    if (seq !== loadSeq) return;
+    cachedDeals = deals;
+    // Quote-based figures show "…" until the quotes are in
+    quoteDealIds = null; quoteLoadError = null;
+    blownInDealIds = null; blownInLoadError = null;
     render(cachedDeals, currentFilter);
-    // Fire blown-in detection in background; re-render when done
-    blownInLoadError = null;
-    fetchBlownInDealIds().then(set => {
-      blownInDealIds = set;
+    fetchQuoteData(ids => {
+      if (seq !== loadSeq) return;
+      quoteDealIds = ids;
+      if (cachedDeals) render(cachedDeals, currentFilter);
+    }).then(res => {
+      if (seq !== loadSeq) return;
+      if (res.quoteError) { quoteLoadError = res.quoteError; blownInLoadError = res.quoteError; }
+      else if (res.error) blownInLoadError = res.error;
+      else blownInDealIds = res.set;
       if (cachedDeals) render(cachedDeals, currentFilter);
     });
   } catch (e) {
@@ -1303,11 +1450,16 @@ async function loadAndRender() {
 window.__sp_refresh = loadAndRender;
 window.__sp_setFilter = function (filterId) {
   currentFilter = filterId;
+  if (filterId === "custom") ensureCustomDefaults();
   if (cachedDeals) {
     render(cachedDeals, currentFilter);
   } else {
     loadAndRender();
   }
+};
+window.__sp_setBasis = function (basis) {
+  periodBasis = basis === "closing" ? "closing" : "created";
+  if (cachedDeals) render(cachedDeals, currentFilter);
 };
 window.__sp_setCustomDate = function (which, value) {
   if (which === "from") customFrom = value;
