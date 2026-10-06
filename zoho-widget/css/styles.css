@@ -559,3 +559,9 @@ body {
   font-size: 12px;
 }
 .bd-empty { padding: 10px; color: #64748b; font-size: 12px; background: #f8fafc; border-radius: 6px; }
+
+/* Bad debt block */
+.bad-debt-panel { border-color: #cbd5e1; }
+.bad-debt-panel h3 { color: #475569; }
+.action-row.baddebt { background: #f8fafc; color: #475569; }
+.action-row.baddebt:hover { background: #f1f5f9; }

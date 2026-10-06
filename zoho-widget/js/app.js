@@ -10,6 +10,12 @@ let TODAY = new Date(); // reset on every (re)load so ages stay correct after Re
 // Subsidy-linked tags: invoicing of these deals usually depends on a programme approval
 const SUBSIDY_TAGS = ["Green Fund", "Bairros+Sustentaveis"];
 
+// Old non-payers: deals tagged "Bad debt" are shown in their own block and left out of all totals
+const BAD_DEBT_TAG = "Bad debt";
+function isBadDebt(d) {
+  return (d.Tag || []).some(t => (t.name || "").toLowerCase() === BAD_DEBT_TAG.toLowerCase());
+}
+
 function log(...args) {
   if (window.console) console.log("[EnergyEase Widget]", ...args);
 }
@@ -587,6 +593,28 @@ function cashSummaryHtml(c) {
   </div>`;
 }
 
+// Old non-payers (tag "Bad debt"): own block, not in the cash figures or the stage panels
+function badDebtHtml(badDebt) {
+  if (!badDebt.length) return "";
+  const figs = badDebt.map(d => INVOICE_MODE ? INV_FIG.get(d.id) : null);
+  const open = figs.reduce((s, f) => s + (f ? f.open : 0), 0);
+  registerDrill("bad_debt_all", "Bad debt", `${badDebt.length} deals tagged "${BAD_DEBT_TAG}" · not in the totals`, badDebt);
+  if (INVOICE_MODE) {
+    const docs = [];
+    badDebt.forEach(d => (INV_FIG.get(d.id) ? INV_FIG.get(d.id).docs : []).forEach(f => { if (num(f.Open_excl_VAT) > 0) { f.__deal = d; docs.push(f); } }));
+    registerInvoiceDrill("inv_baddebt", "Bad debt: open invoices", `Invoices of deals tagged "${BAD_DEBT_TAG}", not in the totals`, docs);
+  }
+  return `<div class="stage-panel bad-debt-panel" id="bad-debt-panel">
+    <div class="stage-panel-header clickable" onclick="window.__showDrill('bad_debt_all')">
+      <h3>Bad debt <span style="font-weight:400; color:#64748b; font-size:11px;">&middot; old non-payers, not in the figures above (tag "${escapeHtml(BAD_DEBT_TAG)}")</span></h3>
+      <span class="count">${badDebt.length} deal${badDebt.length === 1 ? "" : "s"}${INVOICE_MODE ? ` &middot; ${fmtEur(open)} open` : ""}</span>
+    </div>
+    <div class="action-group baddebt">
+      ${badDebt.map(d => rowHtml(d, "baddebt")).join("")}
+    </div>
+  </div>`;
+}
+
 // Green Fund is a pre-won stage (between Quote Sent and Negotiation/Review): the customer said yes,
 // but the deal waits for the subsidy programme. Not part of the cash figures above.
 function greenFundHtml(gfDeals) {
@@ -818,6 +846,9 @@ function dealBreakdownHtml(d, f) {
 
   // 4. Where this deal counts in the tiles above
   let tiles = "";
+  if (isBadDebt(d)) {
+    tiles += line("Bad debt: not in the tiles", fmtEur(f.open), `still open on invoices; the deal has the tag "${BAD_DEBT_TAG}". Remove the tag to count it again.`, "bd-total");
+  } else {
   if (f.open > 0) tiles += line("Outstanding invoices", fmtEur(f.open), f.overdue > 0 ? `${fmtEur(f.overdue)} of it in Overdue` : "in Open, not yet due");
   if (s.now > 0) tiles += line("To invoice NOW", fmtEur(s.now), s.nowKind === "first"
     ? `1st invoice, estimated at 50% of ${fmtEur(f.value)}: nothing is invoiced yet, so the real split is unknown`
@@ -829,6 +860,7 @@ function dealBreakdownHtml(d, f) {
   if (d.Stage === "Scheduled Execution" || d.Stage === "Project Started") tiles += line("In execution", fmtEur(f.value), `value; ${fmtEur(f.paid)} of it received`);
   const still = f.open + s.now + s.later;
   tiles += line("<strong>Total still to receive</strong>", `<strong>${fmtEur(still)}</strong>`, "open + to invoice now + after completion", "bd-total");
+  }
 
   return `<div class="modal-overlay" onclick="window.__closeBreakdown()">
     <div class="modal-card bd-card" onclick="event.stopPropagation()">
@@ -928,7 +960,11 @@ window.__showInvoiceDrill = function (key) {
   container.style.display = "block";
 };
 
-function outstandingHtmlInvoices(c, unlinked, lastSync) {
+function outstandingHtmlInvoices(c, unlinked, lastSync, badDebt) {
+  const bdOpen = (badDebt || []).reduce((s, d) => s + ((INV_FIG.get(d.id) || {}).open || 0), 0);
+  const bdNote = (badDebt || []).length
+    ? `<div class="outstanding-note clickable" style="background:#f1f5f9;color:#334155;" onclick="document.getElementById('bad-debt-panel').scrollIntoView({behavior:'smooth'})"><strong>Not in these figures:</strong> ${badDebt.length} bad-debt deal${badDebt.length === 1 ? "" : "s"} with ${fmtEur(bdOpen)} still open (${badDebt.map(dealRef).join(", ")}). See the Bad debt block below.</div>`
+    : "";
   registerInvoiceDrill("inv_overdue", "Overdue invoices", "Open and past the due date, per InvoiceXpress", c.overdueDocs);
   registerInvoiceDrill("inv_notdue", "Open invoices, not yet due", "Sent and not paid, due date still ahead", c.notDueDocs);
   registerInvoiceDrill("inv_total", "All open invoices", "Everything still to be paid on invoices already sent", c.totalOutstandingDocs);
@@ -957,6 +993,7 @@ function outstandingHtmlInvoices(c, unlinked, lastSync) {
       </div>
     </div>
     ${unlinkedTile}
+    ${bdNote}
     <div class="outstanding-note">
       <strong>How this is calculated:</strong> open and overdue come straight from InvoiceXpress. "To invoice" uses the deal value (sum of invoiced quotes, else the CRM amount, minus an "x% Discount" tag) minus what has been invoiced net of credit notes; a first invoice that was not sent yet counts as 50%. <strong>Click any amount in a deal row</strong> to see the calculation and the invoices behind it, with links to InvoiceXpress.
       ${c.mismatchDeals.length ? `<br><strong>Check:</strong> ${c.mismatchDeals.length} deal${c.mismatchDeals.length === 1 ? "" : "s"} where the CRM amount differs from the invoiced quotes (${c.mismatchDeals.map(dealRef).join(", ")}).` : ""}
@@ -1015,8 +1052,9 @@ function cashSummaryHtmlInvoices(c) {
 function render(deals, faturas) {
   TODAY = new Date();
   const filtered = deals.filter(d =>
-    (d.Pipeline === PIPELINE_FILTER) && ACTIVE_STAGES.includes(d.Stage)
+    (d.Pipeline === PIPELINE_FILTER) && ACTIVE_STAGES.includes(d.Stage) && !isBadDebt(d)
   );
+  const badDebt = deals.filter(d => isBadDebt(d));
   const greenFund = deals.filter(d => d.Pipeline === PIPELINE_FILTER && d.Stage === "Green Fund");
 
   log("Active deals:", filtered.length);
@@ -1042,8 +1080,9 @@ function render(deals, faturas) {
     filtered.forEach(d => inv.set(d.id, invoiceFigures(d, byDeal[d.id])));
     // deals in other stages (e.g. Project Finalised) that still have an open invoice
     const activeIds = new Set(filtered.map(d => d.id));
-    others = deals.filter(d => !activeIds.has(d.id) && (byDeal[d.id] || []).some(f => f.Payment_Status === "Open"));
+    others = deals.filter(d => !activeIds.has(d.id) && !isBadDebt(d) && (byDeal[d.id] || []).some(f => f.Payment_Status === "Open"));
     others.forEach(d => inv.set(d.id, invoiceFigures(d, byDeal[d.id])));
+    badDebt.forEach(d => inv.set(d.id, invoiceFigures(d, byDeal[d.id])));
     const cutoff = new Date(TODAY.getTime() - 90 * 86400000).toISOString().slice(0, 10);
     unlinked = faturas.filter(f => !(f.Deal && f.Deal.id) && !SKIP_STATUS.has(f.Payment_Status) &&
       (f.Payment_Status === "Open" || (f.Invoice_Date || "") >= cutoff));
@@ -1077,10 +1116,11 @@ function render(deals, faturas) {
     <div class="scope-note">
       <strong>Scope:</strong> Pipeline = Regular, stages where action is required (Closed Won → Project Done), plus the Green Fund stage at the bottom. Project Finalised only shows when an invoice is still open. Test deals are filtered out automatically.
     </div>
-    ${INVOICE_MODE ? outstandingHtmlInvoices(cash, unlinked, lastSync) : outstandingHtml(cash)}
+    ${INVOICE_MODE ? outstandingHtmlInvoices(cash, unlinked, lastSync, badDebt) : outstandingHtml(cash)}
     ${INVOICE_MODE ? cashSummaryHtmlInvoices(cash) : cashSummaryHtml(cash)}
     ${stagesToShow.map(s => panelHtml(s.name, dealsByStage[s.name] || [], s.fn, s.note)).join("")}
     ${INVOICE_MODE && others.length ? panelHtml("Other stages", others, invFn, "e.g. Project Finalised with an invoice still open") : ""}
+    ${badDebtHtml(badDebt)}
     ${greenFundHtml(greenFund)}
   `;
 
@@ -1088,7 +1128,7 @@ function render(deals, faturas) {
 
   // Days in stage: load the Stage History of the active deals, after the dashboard is visible.
   // Green Fund deals (about 75) are only loaded when their list is opened.
-  const stageDeals = Array.from(new Set(filtered.concat(others)));
+  const stageDeals = Array.from(new Set(filtered.concat(others, badDebt)));
   setTimeout(() => loadStageSince(stageDeals), 0);
 
   // Wire row clicks to open the deal in CRM
