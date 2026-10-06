@@ -7,6 +7,8 @@ Live action-items widget for Zoho CRM. Replaces the static HTML dashboard's Tab 
 - **Cash summary tiles** — outstanding invoices, to-invoice-now, in-execution value, future 2nd invoice, total still to receive
 - **Action panels per stage** — Closed Won, Scheduled Execution, Project Started, Project Done — with tag-aware classification (invoice todo / payment overdue / Cetelem pending / on track)
 - **Click any deal** to open it directly in CRM
+- **Click any amount** (invoice mode) for a breakdown of the deal: where the value comes from, every InvoiceXpress document with links to the PDF and the Faturas record, and the calculation
+- **In stage**: days since the deal entered its current stage, from Zoho's Stage History (loaded after the dashboard is visible; Green Fund deals only when their list is opened)
 
 ## How it works
 

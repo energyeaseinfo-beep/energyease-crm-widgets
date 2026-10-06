@@ -31,6 +31,77 @@ function ageStr(d) {
   return days === null ? "-" : days + "d";
 }
 
+// ---------- Days in the current stage, from Zoho's Stage History ----------
+// Modified_Time changes with every edit of the deal, also when the hourly InvoiceXpress sync
+// changes a payment tag. The moment the deal entered its current stage does not.
+let STAGE_SINCE = new Map();   // deal id -> time the deal entered its current stage ("" = unknown)
+let STAGE_DEALS = new Map();   // deal id -> deal, for updating the cells once the history is in
+let STAGE_GEN = 0;             // bumped on Refresh, so answers from an older load are ignored
+const STAGE_PENDING = new Set();
+const STAGE_TITLE = "Days since the deal entered its current stage (Zoho Stage History). Tag changes do not reset it.";
+
+// Calendar days between a timestamp and today (1 Sep -> 5 Oct = 34), in the viewer's time zone
+function calDaysSince(t) {
+  const a = new Date(t), b = new Date(TODAY);
+  if (isNaN(a)) return null;
+  a.setHours(0, 0, 0, 0); b.setHours(0, 0, 0, 0);
+  return Math.round((b - a) / 86400000);
+}
+function stageAgeStr(d) {
+  const t = STAGE_SINCE.get(d.id);
+  if (t === undefined) return "…";
+  const n = t ? calDaysSince(t) : null;
+  return n === null ? "-" : n + "d";
+}
+function stageLongStr(d) {
+  const t = STAGE_SINCE.get(d.id);
+  if (t === undefined) return "loading stage history…";
+  if (!t) return "date unknown";
+  const n = calDaysSince(t);
+  const date = new Date(t).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+  return `since ${date} (${n} day${n === 1 ? "" : "s"})`;
+}
+function stageAgeCell(d) {
+  return `<span class="stage-age" data-stage-deal="${escapeHtml(d.id)}" title="${STAGE_TITLE}">${stageAgeStr(d)}</span>`;
+}
+function updateStageCells(id) {
+  const d = STAGE_DEALS.get(id);
+  if (!d) return;
+  document.querySelectorAll(`[data-stage-deal="${id}"]`).forEach(el => { el.textContent = stageAgeStr(d); });
+  document.querySelectorAll(`[data-stage-long="${id}"]`).forEach(el => { el.textContent = stageLongStr(d); });
+}
+
+// Loads the Stage History of the given deals (5 requests at a time). Deals already loaded or
+// loading are skipped, so calling it again for a drill-down list only fetches what is missing.
+async function loadStageSince(deals) {
+  const gen = STAGE_GEN;
+  deals.forEach(d => d && d.id && STAGE_DEALS.set(d.id, d));
+  const queue = deals.filter(d => d && d.id && !STAGE_SINCE.has(d.id) && !STAGE_PENDING.has(d.id));
+  queue.forEach(d => STAGE_PENDING.add(d.id));
+  const worker = async () => {
+    while (queue.length) {
+      const d = queue.shift();
+      let since = "";
+      try {
+        const resp = await ZOHO.CRM.API.getRelatedRecords({ Entity: "Deals", RecordID: d.id, RelatedList: "Stage_History", page: 1, per_page: 200 });
+        let best = null;
+        ((resp && resp.data) || []).forEach(r => {
+          if (r.Stage !== d.Stage || !r.Modified_Time) return;
+          if (!best || Date.parse(r.Modified_Time) > Date.parse(best.Modified_Time)) best = r;
+        });
+        since = best ? best.Modified_Time : "";
+      } catch (e) {
+        log("Stage history not available for", d.id, e);
+      }
+      if (gen !== STAGE_GEN) return;          // a Refresh started a new load
+      STAGE_PENDING.delete(d.id);
+      STAGE_SINCE.set(d.id, since);
+      updateStageCells(d.id);
+    }
+  };
+  await Promise.all([1, 2, 3, 4, 5].map(worker));
+}
+
 function hasTag(deal, name) {
   return (deal.Tag || []).some(t => (t.name || "").toLowerCase() === name.toLowerCase());
 }
@@ -128,17 +199,25 @@ function renderError(msg, detail) {
 // ============== DRILL-DOWN MODAL ==============
 window.__drillData = window.__drillData || {};
 // tileValue (optional): the amount the tile shows, which can differ from the sum of full deal values
-function registerDrill(key, title, subtitle, deals, tileValue) {
-  window.__drillData[key] = { title, subtitle, deals, tileValue };
+// tileAmount (optional, invoice mode): { label, fn(deal) -> amount this deal adds to the tile }
+function registerDrill(key, title, subtitle, deals, tileValue, tileAmount) {
+  window.__drillData[key] = { title, subtitle, deals, tileValue, tileAmount };
 }
 
-function renderDrillRow(d) {
+// In invoice mode the value the figures use (invoiced quotes or CRM amount, minus discount tag)
+function dealValue(d) {
+  const f = INVOICE_MODE ? INV_FIG.get(d.id) : null;
+  return f ? f.value : (Number(d.Amount) || 0);
+}
+
+function renderDrillRow(d, tileAmount) {
   const owner = (d.Owner && (d.Owner.name || d.Owner.full_name)) || "-";
   const ref = d.Reference_Number || ("#" + (d.id || "").slice(-4));
   const name = d.Deal_Name || "(no name)";
   const stage = d.Stage || "-";
-  const amount = d.Amount ? fmtEur(d.Amount) : "-";
-  const age = ageStr(d);
+  const value = dealValue(d);
+  const amount = value ? amtLink(d, fmtEur(value)) : "-";
+  const inTile = tileAmount ? `<td class="num">${amtLink(d, fmtEur(tileAmount.fn(d)))}</td>` : "";
   const tagsList = (d.Tag || []).map(t => escapeHtml(t.name)).join(", ") || "-";
   return `<tr class="drill-row" data-deal-id="${escapeHtml(d.id)}" onclick="window.__openDealInCrm('${escapeHtml(d.id)}')">
     <td class="drill-ref">${escapeHtml(ref)}</td>
@@ -146,7 +225,8 @@ function renderDrillRow(d) {
     <td>${escapeHtml(owner)}</td>
     <td>${escapeHtml(stage)}</td>
     <td class="num">${amount}</td>
-    <td>${age}</td>
+    ${inTile}
+    <td>${stageAgeCell(d)}</td>
     <td class="drill-tags">${tagsList}</td>
   </tr>`;
 }
@@ -154,20 +234,23 @@ function renderDrillRow(d) {
 window.__showDrill = function (key) {
   const item = window.__drillData[key];
   if (!item) { log("No drill data for key", key); return; }
-  openDrillModal(item.title, item.subtitle, item.deals, item.tileValue);
+  openDrillModal(item.title, item.subtitle, item.deals, item.tileValue, item.tileAmount);
 };
 
-function openDrillModal(title, subtitle, deals, tileValue) {
+function openDrillModal(title, subtitle, deals, tileValue, tileAmount) {
   let container = document.getElementById("drill-modal-container");
   if (!container) {
     container = document.createElement("div");
     container.id = "drill-modal-container";
     document.body.appendChild(container);
   }
-  const sortedDeals = (deals || []).slice().sort((a, b) =>
-    new Date(b.Modified_Time || 0) - new Date(a.Modified_Time || 0)
+  const stageKey = d => { const t = STAGE_SINCE.get(d.id); return t ? Date.parse(t) : Infinity; };
+  const sortedDeals = (deals || []).slice().sort((a, b) => tileAmount
+    ? tileAmount.fn(b) - tileAmount.fn(a)
+    : (stageKey(a) - stageKey(b)) || (new Date(b.Modified_Time || 0) - new Date(a.Modified_Time || 0))
   );
-  const totalAmount = sortedDeals.reduce((s, d) => s + (Number(d.Amount) || 0), 0);
+  const totalAmount = sortedDeals.reduce((s, d) => s + dealValue(d), 0);
+  const tileSum = tileAmount ? sortedDeals.reduce((s, d) => s + tileAmount.fn(d), 0) : null;
   container.innerHTML = `<div class="modal-overlay" onclick="window.__closeDrill(event)">
     <div class="modal-card" onclick="event.stopPropagation()">
       <div class="modal-header">
@@ -177,7 +260,8 @@ function openDrillModal(title, subtitle, deals, tileValue) {
           <div class="modal-stats">
             <span><strong>${sortedDeals.length}</strong> deal${sortedDeals.length === 1 ? '' : 's'}</span>
             ${tileValue !== undefined && tileValue !== null ? `<span>In this tile: <strong>${fmtEur(tileValue)}</strong></span>` : ""}
-            <span>Full deal value: <strong>${fmtEur(totalAmount)}</strong></span>
+            ${tileAmount && tileAmount.sums && tileValue !== undefined && tileValue !== null && Math.abs(tileSum - tileValue) > 1 ? `<span style="color:#b91c1c;">Rows add up to ${fmtEur(tileSum)}</span>` : ""}
+            <span>${INVOICE_MODE ? "Value of these deals" : "Full deal value"}: <strong>${fmtEur(totalAmount)}</strong></span>
           </div>
         </div>
         <button class="modal-close" onclick="window.__closeDrill()" aria-label="Close">×</button>
@@ -193,22 +277,24 @@ function openDrillModal(title, subtitle, deals, tileValue) {
               <th>Deal Name</th>
               <th>Owner</th>
               <th>Stage</th>
-              <th class="num">Amount</th>
-              <th title="Days since the deal was last changed in CRM">Last change</th>
+              <th class="num" title="${INVOICE_MODE ? "Value the figures use: invoiced quotes, or the CRM amount when there is no invoice yet" : "Amount field of the deal"}">${INVOICE_MODE ? "Value" : "Amount"}</th>
+              ${tileAmount ? `<th class="num">${escapeHtml(tileAmount.label)}</th>` : ""}
+              <th title="${STAGE_TITLE}">In stage</th>
               <th>Tags</th>
             </tr>
           </thead>
           <tbody id="modal-tbody">
-            ${sortedDeals.length ? sortedDeals.map(d => renderDrillRow(d)).join('') : '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:20px;">No deals match</td></tr>'}
+            ${sortedDeals.length ? sortedDeals.map(d => renderDrillRow(d, tileAmount)).join('') : `<tr><td colspan="${tileAmount ? 8 : 7}" style="text-align:center;color:#94a3b8;padding:20px;">No deals match</td></tr>`}
           </tbody>
         </table>
       </div>
       <div class="modal-footer">
-        <span class="modal-footer-hint">Click any row to open the deal in Zoho CRM · ESC or click outside to close</span>
+        <span class="modal-footer-hint">${INVOICE_MODE ? "Click an amount to see how it is calculated and the invoices behind it · " : ""}Click any row to open the deal in Zoho CRM · ESC or click outside to close</span>
       </div>
     </div>
   </div>`;
   container.style.display = "block";
+  loadStageSince(sortedDeals);
   setTimeout(() => {
     const handler = (e) => {
       if (e.key === "Escape") {
@@ -270,7 +356,18 @@ function invoiceCell(f, d) {
   else if (f.open > 0) { txt = `${fmtEur(f.open)} open`; tip = "Invoice sent, not due yet"; }
   else if (f.invoicedNothing || (d.Stage === "Project Done" && f.toInvoice > f.tol)) { txt = `${fmtEur(f.invoicedNothing && d.Stage !== "Project Done" ? f.value * 0.5 : f.toInvoice)} to invoice`; tip = "Not invoiced yet"; }
   else { txt = `${fmtEur(f.paid)} paid`; tip = "Received so far, excl. VAT"; }
-  return `<div class="age inv-cell" title="${tip}">${txt}</div>`;
+  return `<div class="age inv-cell">${amtLink(d, txt, tip + ". Click to see the calculation and the invoices.")}</div>`;
+}
+
+// Amount column: in invoice mode the value the figures use, with its source
+function amountCellHtml(d) {
+  const f = INVOICE_MODE ? INV_FIG.get(d.id) : null;
+  if (!f) return `<div class="amount">${fmtEur(d.Amount)}</div>`;
+  const label = f.valueSource === "quotes" ? (f.crmMismatch ? "quote ≠ CRM" : "quote") : "CRM";
+  const title = f.valueSource === "quotes"
+    ? `Sum of the invoiced quotes${f.disc ? ", minus discount tag" : ""}` + (f.crmMismatch ? `. The CRM amount is ${fmtEur(f.crmAmount)}.` : ".")
+    : `Amount field in CRM${f.disc ? ", minus discount tag" : ""}: no invoice yet.`;
+  return `<div class="amount">${amtLink(d, `${fmtEur(f.value)}<span class="src-label${f.crmMismatch ? " warn" : ""}">${label}</span>`, title + " Click for the calculation.")}</div>`;
 }
 
 function rowHtml(d, cls) {
@@ -280,8 +377,8 @@ function rowHtml(d, cls) {
     <div class="ref">${escapeHtml(ref)}</div>
     <div class="name" title="${escapeHtml(d.Deal_Name)}">${escapeHtml(d.Deal_Name)}</div>
     <div class="owner">${escapeHtml(ownerName)}</div>
-    <div class="amount">${fmtEur(d.Amount)}</div>
-    ${INVOICE_MODE && INV_FIG.get(d.id) ? invoiceCell(INV_FIG.get(d.id), d) : `<div class="age" title="Days since the deal was last changed in CRM (not since the invoice)">${ageStr(d)}</div>`}
+    ${amountCellHtml(d)}
+    ${INVOICE_MODE && INV_FIG.get(d.id) ? invoiceCell(INV_FIG.get(d.id), d) : `<div class="age">${stageAgeCell(d)}</div>`}
     <div class="tags">${tagPills(d)}</div>
   </div>`;
 }
@@ -534,9 +631,10 @@ function dealRef(d) { return d.Reference_Number || ("#" + String(d.id || "").sli
 
 // Per-deal invoice figures (all amounts excl. VAT)
 function invoiceFigures(d, docs) {
-  docs = (docs || []).filter(f => !SKIP_STATUS.has(f.Payment_Status));
+  const allDocs = (docs || []).slice();          // incl. canceled and draft, shown greyed in the breakdown
+  docs = allDocs.filter(f => !SKIP_STATUS.has(f.Payment_Status));
   const disc = discountShare(d);
-  const qvals = new Set();
+  const qvals = new Map();                         // quote value -> invoice numbers that carry it
   let net = 0, paid = 0, open = 0, overdue = 0, maxDays = 0;
   docs.forEach(f => {
     net += num(f.Amount_excl_VAT);
@@ -546,15 +644,42 @@ function invoiceFigures(d, docs) {
     if (f.Document_Type !== "Credit note") {
       const tot = num(f.Total_incl_VAT);
       if (tot) paid += num(f.Paid_incl_VAT) * num(f.Amount_excl_VAT) / tot;
-      qvals.add(num(f.Quote_Value));
+      const qv = num(f.Quote_Value);
+      if (!qvals.has(qv)) qvals.set(qv, []);
+      qvals.get(qv).push(f.Name || "");
     }
   });
-  const quoteBased = Array.from(qvals).reduce((s, v) => s + v, 0);
-  const value = (qvals.size ? quoteBased : num(d.Amount)) * (1 - disc);
+  const quoteBased = Array.from(qvals.keys()).reduce((s, v) => s + v, 0);
+  const valueSource = qvals.size ? "quotes" : "crm";
+  const baseValue = qvals.size ? quoteBased : num(d.Amount);
+  const value = baseValue * (1 - disc);
   const tol = Math.max(1, 0.01 * value);
   const toInvoice = Math.max(value - net, 0);
   const crmMismatch = qvals.size > 0 && Math.abs(quoteBased - num(d.Amount)) > Math.max(1, 0.01 * num(d.Amount));
-  return { docs, value, net, paid, open, overdue, maxDays, toInvoice, tol, crmMismatch, invoicedNothing: net <= tol };
+  const fig = {
+    docs, allDocs, value, baseValue, valueSource, disc, crmAmount: num(d.Amount),
+    quotes: Array.from(qvals.entries()).map(([v, names]) => ({ value: v, invoices: names })),
+    net, paid, open, overdue, maxDays, toInvoice, tol, crmMismatch, invoicedNothing: net <= tol
+  };
+  fig.split = invoiceSplit(d, fig);
+  return fig;
+}
+
+// How the part that is not invoiced yet splits into "to invoice now" and "after project completion".
+// Used by the tiles and by the per-deal breakdown, so both always show the same numbers.
+function invoiceSplit(d, f) {
+  let now = 0, later = 0, nowKind = "";
+  if (d.Stage === "Project Done") {
+    now = f.toInvoice > f.tol ? f.toInvoice : 0;  // final invoice
+    if (now) nowKind = "final";
+  } else if (f.invoicedNothing) {
+    now = f.value * 0.5;                           // 1st invoice, default 50%
+    later = f.value - now;
+    nowKind = "first";
+  } else {
+    later = f.toInvoice > f.tol ? f.toInvoice : 0;
+  }
+  return { now, later, nowKind };
 }
 
 // Same decision as the payment tags
@@ -589,17 +714,9 @@ function computeCashFromInvoices(deals, inv) {
       c.stillToReceiveDeals.add(d);
     });
     if (f.crmMismatch) c.mismatchDeals.push(d);
-    let nowAmt = 0, laterAmt = 0;
-    if (d.Stage === "Project Done") {
-      nowAmt = f.toInvoice > f.tol ? f.toInvoice : 0;
-      if (nowAmt) c.toInvoiceFinalDeals.push(d);
-    } else if (f.invoicedNothing) {
-      nowAmt = f.value * 0.5;            // 1st invoice, default 50%
-      laterAmt = f.value - nowAmt;
-      c.toInvoiceFirstDeals.push(d);
-    } else {
-      laterAmt = f.toInvoice > f.tol ? f.toInvoice : 0;
-    }
+    const nowAmt = f.split.now, laterAmt = f.split.later;
+    if (f.split.nowKind === "final") c.toInvoiceFinalDeals.push(d);
+    else if (f.split.nowKind === "first") c.toInvoiceFirstDeals.push(d);
     c.toInvoiceNow += nowAmt;
     if (subsidy) c.toInvoiceSubsidyValue += nowAmt;
     if (nowAmt) c.stillToReceiveDeals.add(d);
@@ -618,6 +735,156 @@ function computeCashFromInvoices(deals, inv) {
   return c;
 }
 
+// ---------- Per-deal breakdown: how every amount is calculated, with links to the sources ----------
+let DEAL_BY_ID = new Map();   // deal id -> deal, for the breakdown
+let LAST_SYNC_TXT = null;     // last Faturas sync, shown in the breakdown footer
+
+const LINK_LABEL = {
+  "Linked by reference": "deal number in the InvoiceXpress reference",
+  "Linked via quote": "quote number in the InvoiceXpress reference",
+  "Linked via original": "credit note on a linked invoice",
+  "Linked manually": "linked by hand in Faturas",
+  "Linked by client match": "same client and quote amount"
+};
+
+window.__openFaturaInCrm = function (id) {
+  if (window.ZOHO && ZOHO.CRM && ZOHO.CRM.UI && ZOHO.CRM.UI.Record) {
+    ZOHO.CRM.UI.Record.open({ Entity: FATURAS_MODULE, RecordID: id }).catch(e => log("open error", e));
+  }
+};
+
+function docPaidExcl(f) {
+  if (f.Document_Type === "Credit note") return 0;
+  const tot = num(f.Total_incl_VAT);
+  return tot ? num(f.Paid_incl_VAT) * num(f.Amount_excl_VAT) / tot : 0;
+}
+
+function dealBreakdownHtml(d, f) {
+  const ref = dealRef(d);
+  const owner = (d.Owner && (d.Owner.name || d.Owner.full_name)) || "-";
+  const s = f.split;
+  const line = (label, amount, note, cls) =>
+    `<tr class="${cls || ""}"><td>${label}</td><td class="num">${amount}</td><td class="bd-note">${note || ""}</td></tr>`;
+
+  // 1. Value of the deal and where it comes from
+  let valueRows = "";
+  if (f.valueSource === "quotes") {
+    f.quotes.forEach(q => {
+      valueRows += line(`Quote total on ${escapeHtml(q.invoices.filter(Boolean).join(", ") || "invoice")}`, fmtEur(q.value),
+        "the quote amount (before discount) printed on the invoice in InvoiceXpress");
+    });
+    if (f.quotes.length > 1) valueRows += line("Sum of the invoiced quotes", fmtEur(f.baseValue), "", "bd-sub");
+  } else {
+    valueRows += line("Amount field of the deal in CRM", fmtEur(f.crmAmount), "used because there is no invoice for this deal yet");
+  }
+  if (f.disc) valueRows += line(`Minus ${Math.round(f.disc * 100)}% Discount tag`, "−" + fmtEur(f.baseValue * f.disc), "tag on the deal in CRM");
+  valueRows += line("<strong>Value used in the figures</strong>", `<strong>${fmtEur(f.value)}</strong>`, "", "bd-total");
+  const mismatch = f.crmMismatch
+    ? `<div class="bd-warn">The Amount field in CRM says <strong>${fmtEur(f.crmAmount)}</strong>, the invoiced quotes add up to <strong>${fmtEur(f.baseValue)}</strong>. The figures follow the invoices. Update the deal amount in CRM, or check whether an invoice is linked to the wrong deal.</div>`
+    : "";
+
+  // 2. Documents in InvoiceXpress
+  const docs = f.allDocs.slice().sort((a, b) => String(a.Invoice_Date || "").localeCompare(String(b.Invoice_Date || "")));
+  const docRows = docs.map(x => {
+    const skipped = SKIP_STATUS.has(x.Payment_Status);
+    const days = num(x.Days_Overdue);
+    const pdf = x.PDF_Link ? `<a href="${escapeHtml(x.PDF_Link)}" target="_blank" rel="noopener">PDF</a>` : "";
+    const rec = x.id ? `<a href="#" onclick="event.preventDefault(); window.__openFaturaInCrm('${escapeHtml(x.id)}')">Faturas</a>` : "";
+    return `<tr class="${skipped ? "bd-skipped" : ""}">
+      <td class="drill-ref">${escapeHtml(x.Name || "")}</td>
+      <td>${escapeHtml(x.Document_Type || "")}</td>
+      <td>${escapeHtml(x.Invoice_Date || "-")}</td>
+      <td>${escapeHtml(x.Due_Date || "-")}</td>
+      <td>${escapeHtml(x.Payment_Status || "")}${skipped ? " (not counted)" : ""}</td>
+      <td class="num">${num(x.Amount_excl_VAT) < 0 ? "−" + fmtEur(-num(x.Amount_excl_VAT)) : fmtEur(num(x.Amount_excl_VAT))}</td>
+      <td class="num">${skipped ? "-" : fmtEur(docPaidExcl(x))}</td>
+      <td class="num">${skipped ? "-" : fmtEur(num(x.Open_excl_VAT))}</td>
+      <td class="num">${days > 0 ? days + "d" : "-"}</td>
+      <td class="bd-note">${escapeHtml(LINK_LABEL[x.Link_Status] || x.Link_Status || "")}</td>
+      <td class="bd-links">${[pdf, rec].filter(Boolean).join(" · ")}</td>
+    </tr>`;
+  }).join("");
+  const docTable = docs.length
+    ? `<table class="modal-table bd-table"><thead><tr><th>Document</th><th>Type</th><th>Date</th><th>Due</th><th>Status</th><th class="num">Excl. VAT</th><th class="num">Paid</th><th class="num">Open</th><th class="num">Late</th><th>How it is linked</th><th>Source</th></tr></thead><tbody>${docRows}</tbody></table>`
+    : `<div class="bd-empty">No invoice in InvoiceXpress is linked to ${escapeHtml(ref)} yet. The sync links an invoice when its reference contains ${escapeHtml(ref)} or the quote number.</div>`;
+
+  // 3. The calculation
+  let calc = "";
+  calc += line("Value used", fmtEur(f.value), (f.valueSource === "quotes" ? "sum of the invoiced quotes" : "CRM amount") + (f.disc ? ", minus discount tag" : ""));
+  calc += line("Minus invoiced so far", "−" + fmtEur(f.net), "invoices minus credit notes, canceled ones not counted");
+  calc += line("<strong>Not invoiced yet</strong>", `<strong>${fmtEur(f.toInvoice)}</strong>`, f.toInvoice <= f.tol && f.toInvoice > 0 ? "less than 1% of the value, treated as fully invoiced" : "", "bd-total");
+  calc += line("Paid so far", fmtEur(f.paid), "paid invoices, excl. VAT");
+  calc += line("Open on sent invoices", fmtEur(f.open), f.overdue > 0 ? `of which ${fmtEur(f.overdue)} overdue, oldest ${f.maxDays} days late` : "");
+
+  // 4. Where this deal counts in the tiles above
+  let tiles = "";
+  if (f.open > 0) tiles += line("Outstanding invoices", fmtEur(f.open), f.overdue > 0 ? `${fmtEur(f.overdue)} of it in Overdue` : "in Open, not yet due");
+  if (s.now > 0) tiles += line("To invoice NOW", fmtEur(s.now), s.nowKind === "first"
+    ? `1st invoice, estimated at 50% of ${fmtEur(f.value)}: nothing is invoiced yet, so the real split is unknown`
+    : `final invoice: value minus what is already invoiced (stage is Project Done)`);
+  if (s.later > 0) tiles += line("After project completion", fmtEur(s.later), s.nowKind === "first"
+    ? "the other 50%, invoiced when the project is done"
+    : "not invoiced yet; the final invoice follows when the stage moves to Project Done");
+  if (d.Stage === "Closed Won") tiles += line("Won, not started", fmtEur(f.value), `value; ${fmtEur(f.paid)} of it received`);
+  if (d.Stage === "Scheduled Execution" || d.Stage === "Project Started") tiles += line("In execution", fmtEur(f.value), `value; ${fmtEur(f.paid)} of it received`);
+  const still = f.open + s.now + s.later;
+  tiles += line("<strong>Total still to receive</strong>", `<strong>${fmtEur(still)}</strong>`, "open + to invoice now + after completion", "bd-total");
+
+  return `<div class="modal-overlay" onclick="window.__closeBreakdown()">
+    <div class="modal-card bd-card" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div class="modal-titleblock">
+          <h3>${escapeHtml(ref)} · ${escapeHtml(d.Deal_Name || "")}</h3>
+          <div class="modal-subtitle">${escapeHtml(d.Stage || "-")} <span data-stage-long="${escapeHtml(d.id)}" title="${STAGE_TITLE}">${escapeHtml(stageLongStr(d))}</span> · ${escapeHtml(owner)} · all amounts excl. VAT</div>
+        </div>
+        <div class="bd-actions">
+          <button class="bd-btn" onclick="window.__openDealInCrm('${escapeHtml(d.id)}')">Open deal in CRM</button>
+          <button class="modal-close" onclick="window.__closeBreakdown()" aria-label="Close">×</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div class="bd-section"><h4>1. Value of the deal</h4><table class="bd-calc">${valueRows}</table>${mismatch}</div>
+        <div class="bd-section"><h4>2. Documents in InvoiceXpress</h4>${docTable}</div>
+        <div class="bd-section"><h4>3. Calculation</h4><table class="bd-calc">${calc}</table></div>
+        <div class="bd-section"><h4>4. Where this deal counts in the tiles</h4><table class="bd-calc">${tiles}</table></div>
+      </div>
+      <div class="modal-footer"><span class="modal-footer-hint">Sources: deal fields and tags from Zoho CRM · documents from InvoiceXpress, synced every hour into the Faturas module (last sync ${escapeHtml(LAST_SYNC_TXT || "-")}) · PDF opens the document in InvoiceXpress, Faturas opens the synced record · ESC or click outside to close</span></div>
+    </div>
+  </div>`;
+}
+
+window.__showDealBreakdown = function (dealId) {
+  const d = DEAL_BY_ID.get(dealId);
+  const f = INV_FIG.get(dealId);
+  if (!d || !f) { log("No breakdown for", dealId); return; }
+  let container = document.getElementById("breakdown-modal-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "breakdown-modal-container";
+    document.body.appendChild(container);
+  }
+  container.innerHTML = dealBreakdownHtml(d, f);
+  container.style.display = "block";
+};
+window.__closeBreakdown = function () {
+  const c = document.getElementById("breakdown-modal-container");
+  if (c) c.style.display = "none";
+};
+// ESC closes the breakdown first (it sits on top of a drill-down list)
+window.addEventListener("keydown", e => {
+  const c = document.getElementById("breakdown-modal-container");
+  if (e.key === "Escape" && c && c.style.display === "block") {
+    window.__closeBreakdown();
+    e.stopPropagation();
+  }
+}, true);
+
+// Clickable amount that opens the breakdown of a deal
+function amtLink(d, html, title) {
+  if (!INVOICE_MODE || !INV_FIG.get(d.id)) return html;
+  return `<span class="amt-link" title="${escapeHtml(title || "Click to see how this is calculated")}" onclick="event.stopPropagation(); window.__showDealBreakdown('${escapeHtml(d.id)}')">${html}</span>`;
+}
+
 // Drill-down listing invoices instead of deals
 window.__invDrill = window.__invDrill || {};
 function registerInvoiceDrill(key, title, subtitle, docs) { window.__invDrill[key] = { title, subtitle, docs }; }
@@ -630,7 +897,9 @@ window.__showInvoiceDrill = function (key) {
   const total = docs.reduce((s, f) => s + num(f.Open_excl_VAT), 0);
   const rows = docs.map(f => {
     const d = f.__deal || {};
-    const pdf = f.PDF_Link ? `<a href="${escapeHtml(f.PDF_Link)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">PDF</a>` : "-";
+    const pdfA = f.PDF_Link ? `<a href="${escapeHtml(f.PDF_Link)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">PDF</a>` : "";
+    const recA = f.id ? `<a href="#" onclick="event.preventDefault(); event.stopPropagation(); window.__openFaturaInCrm('${escapeHtml(f.id)}')">Faturas</a>` : "";
+    const pdf = [pdfA, recA].filter(Boolean).join(" · ") || "-";
     return `<tr class="drill-row" onclick="window.__openDealInCrm('${escapeHtml(d.id || "")}')">
       <td class="drill-ref">${escapeHtml(f.Name || "")}</td>
       <td>${escapeHtml(d.Reference_Number || "-")}</td>
@@ -638,7 +907,7 @@ window.__showInvoiceDrill = function (key) {
       <td>${escapeHtml(f.Invoice_Date || "-")}</td>
       <td>${escapeHtml(f.Due_Date || "-")}</td>
       <td class="num">${num(f.Days_Overdue) > 0 ? num(f.Days_Overdue) + "d" : "-"}</td>
-      <td class="num">${fmtEur(num(f.Open_excl_VAT))}</td>
+      <td class="num">${d.id ? amtLink(d, fmtEur(num(f.Open_excl_VAT)), "Click to see the deal's calculation and all its invoices") : fmtEur(num(f.Open_excl_VAT))}</td>
       <td>${pdf}</td>
     </tr>`;
   }).join("");
@@ -651,10 +920,10 @@ window.__showInvoiceDrill = function (key) {
       </div><button class="modal-close" onclick="window.__closeDrill()" aria-label="Close">×</button></div>
       <div class="modal-controls"><input type="text" class="modal-search" placeholder="🔍 Filter…" oninput="window.__filterDrill(this.value)"></div>
       <div class="modal-body"><table class="modal-table">
-        <thead><tr><th>Invoice</th><th>Deal</th><th>Name</th><th>Date</th><th>Due</th><th class="num">Late</th><th class="num">Open</th><th></th></tr></thead>
+        <thead><tr><th>Invoice</th><th>Deal</th><th>Name</th><th>Date</th><th>Due</th><th class="num">Late</th><th class="num">Open</th><th>Source</th></tr></thead>
         <tbody id="modal-tbody">${rows || '<tr><td colspan="8" style="text-align:center;color:#94a3b8;padding:20px;">No invoices</td></tr>'}</tbody>
       </table></div>
-      <div class="modal-footer"><span class="modal-footer-hint">Click a row to open the deal · PDF opens the invoice in InvoiceXpress · ESC or click outside to close</span></div>
+      <div class="modal-footer"><span class="modal-footer-hint">Click a row to open the deal · click the open amount for the deal's calculation · PDF opens the invoice in InvoiceXpress, Faturas the synced record · ESC or click outside to close</span></div>
     </div></div>`;
   container.style.display = "block";
 };
@@ -689,7 +958,7 @@ function outstandingHtmlInvoices(c, unlinked, lastSync) {
     </div>
     ${unlinkedTile}
     <div class="outstanding-note">
-      <strong>How this is calculated:</strong> open and overdue come straight from InvoiceXpress. "To invoice" uses the deal value (sum of invoiced quotes, else the CRM amount, minus an "x% Discount" tag) minus what has been invoiced net of credit notes; a first invoice that was not sent yet counts as 50%.
+      <strong>How this is calculated:</strong> open and overdue come straight from InvoiceXpress. "To invoice" uses the deal value (sum of invoiced quotes, else the CRM amount, minus an "x% Discount" tag) minus what has been invoiced net of credit notes; a first invoice that was not sent yet counts as 50%. <strong>Click any amount in a deal row</strong> to see the calculation and the invoices behind it, with links to InvoiceXpress.
       ${c.mismatchDeals.length ? `<br><strong>Check:</strong> ${c.mismatchDeals.length} deal${c.mismatchDeals.length === 1 ? "" : "s"} where the CRM amount differs from the invoiced quotes (${c.mismatchDeals.map(dealRef).join(", ")}).` : ""}
     </div>
   </div>`;
@@ -697,11 +966,17 @@ function outstandingHtmlInvoices(c, unlinked, lastSync) {
 
 function cashSummaryHtmlInvoices(c) {
   const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
-  registerDrill("cash_to_invoice", "To invoice NOW", `${c.toInvoiceFirstDeals.length}× 1st invoice not sent + ${c.toInvoiceFinalDeals.length}× final invoice not sent`, c.toInvoiceNowDeals, c.toInvoiceNow);
-  registerDrill("cash_wonwait", "Won, not started: value", `${c.wonNotStartedDeals.length} Closed Won deals · ${fmtEur(c.wonNotStartedReceived)} received`, c.wonNotStartedDeals, c.wonNotStartedValue);
-  registerDrill("cash_inexec", "In execution: value", `${c.inExecutionDeals.length} projects · ${fmtEur(c.inExecutionReceived)} received`, c.inExecutionDeals, c.inExecutionValue);
-  registerDrill("cash_future", "After project completion", `${c.futureSecondDeals.length} deals with an invoice still to come after completion`, c.futureSecondDeals, c.futureSecond);
-  registerDrill("cash_total", "Total still to receive", `Outstanding + to invoice now + after completion · ${c.stillToReceiveDeals.length} deals`, c.stillToReceiveDeals, c.stillToReceive);
+  const fig = d => INV_FIG.get(d.id) || { split: { now: 0, later: 0 }, open: 0, paid: 0 };
+  registerDrill("cash_to_invoice", "To invoice NOW", `${c.toInvoiceFirstDeals.length}× 1st invoice not sent (estimated at 50% of the value) + ${c.toInvoiceFinalDeals.length}× final invoice not sent (value minus invoiced)`, c.toInvoiceNowDeals, c.toInvoiceNow,
+    { label: "To invoice now", sums: true, fn: d => fig(d).split.now });
+  registerDrill("cash_wonwait", "Won, not started: value", `${c.wonNotStartedDeals.length} Closed Won deals · ${fmtEur(c.wonNotStartedReceived)} received`, c.wonNotStartedDeals, c.wonNotStartedValue,
+    { label: "Received", fn: d => fig(d).paid });
+  registerDrill("cash_inexec", "In execution: value", `${c.inExecutionDeals.length} projects · ${fmtEur(c.inExecutionReceived)} received`, c.inExecutionDeals, c.inExecutionValue,
+    { label: "Received", fn: d => fig(d).paid });
+  registerDrill("cash_future", "After project completion", `${c.futureSecondDeals.length} deals with an invoice still to come after completion`, c.futureSecondDeals, c.futureSecond,
+    { label: "After completion", sums: true, fn: d => fig(d).split.later });
+  registerDrill("cash_total", "Total still to receive", `Outstanding + to invoice now + after completion · ${c.stillToReceiveDeals.length} deals`, c.stillToReceiveDeals, c.stillToReceive,
+    { label: "Still to receive", sums: true, fn: d => { const f = fig(d); return f.open + f.split.now + f.split.later; } });
   const subsidyNote = c.toInvoiceSubsidyValue > 0 ? ` &middot; of which ${fmtEur(c.toInvoiceSubsidyValue)} subsidy-tagged` : "";
   return `<div class="cash-summary">
     <div class="cash-tile action clickable" onclick="window.__showDrill('cash_to_invoice')">
@@ -763,6 +1038,7 @@ function render(deals, faturas) {
     });
     inv = new Map();
     INV_FIG = inv;
+    DEAL_BY_ID = new Map(deals.map(d => [d.id, d]));
     filtered.forEach(d => inv.set(d.id, invoiceFigures(d, byDeal[d.id])));
     // deals in other stages (e.g. Project Finalised) that still have an open invoice
     const activeIds = new Set(filtered.map(d => d.id));
@@ -772,6 +1048,7 @@ function render(deals, faturas) {
     unlinked = faturas.filter(f => !(f.Deal && f.Deal.id) && !SKIP_STATUS.has(f.Payment_Status) &&
       (f.Payment_Status === "Open" || (f.Invoice_Date || "") >= cutoff));
     if (lastSync) lastSync = new Date(lastSync).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
+    LAST_SYNC_TXT = lastSync;
   }
   const invFn = d => invoiceStatus(d, inv.get(d.id));
   const stagesToShow = INVOICE_MODE ? [
@@ -808,6 +1085,11 @@ function render(deals, faturas) {
   `;
 
   root.innerHTML = html;
+
+  // Days in stage: load the Stage History of the active deals, after the dashboard is visible.
+  // Green Fund deals (about 75) are only loaded when their list is opened.
+  const stageDeals = Array.from(new Set(filtered.concat(others)));
+  setTimeout(() => loadStageSince(stageDeals), 0);
 
   // Wire row clicks to open the deal in CRM
   document.querySelectorAll(".action-row").forEach(row => {
@@ -877,6 +1159,9 @@ async function fetchFaturas() {
 async function loadAndRender() {
   try {
     root.innerHTML = `<div class="loading-state"><div class="spinner"></div><div>Fetching deals from Zoho CRM&hellip;</div></div>`;
+    STAGE_SINCE = new Map();
+    STAGE_PENDING.clear();
+    STAGE_GEN++;
     const [deals, faturas] = await Promise.all([fetchAllDeals(), fetchFaturas()]);
     render(deals, faturas);
   } catch (e) {
